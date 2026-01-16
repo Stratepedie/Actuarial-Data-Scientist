@@ -1,9 +1,6 @@
-##### Book: Computational Actuarial Science with R - Edited by Arthur Charpentier
 
-## Chapter 14: General Insurance Pricing
-
-## Serges Letsudem Wonanke
 ####################################################################################
+############################### Chapter 14 #########################################
 ####################################################################################
 
 ## 14.2.1 Annualized Claims Frequency
