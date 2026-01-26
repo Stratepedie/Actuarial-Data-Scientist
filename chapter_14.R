@@ -3,10 +3,10 @@
 #################### Chapter 14: General Insurance Pricing #########################
 ####################################################################################
 
-#The goal is to propose a premium that an insurance company should charge a
-#client, for a yearly contract, based on a series of characteristics of the: 
-#driver, such as the age or the region, or 
-#car, such as the power, the make, or the type of gas.
+# The goal is to propose a premium that an insurance company should charge a
+# client, for a yearly contract, based on a series of characteristics of the: 
+# driver, such as the age or the region, or 
+# car, such as the power, the make, or the type of gas.
 
 ## 14.1 Introduction and Motivation
 
@@ -169,6 +169,12 @@ summary(model.pois)
 # Fisher Scoring iterations = 6, Convergence was fast and stable, this means no numerical issues with the IRLS algorithm.
 # IRLS stands for Iteratively Reweighted Least Squares.
 
+# In Poisson GLM (log-link + offset(log(exposure))), the MLE estimator beta_cap satisfies the score equations = 0 at convergence.
+# The score vector (gradient of the log-likelihood) is:
+#   score(beta) = X' (Y - mu)   where mu = exp(X*beta + offset) = fitted values
+# At the MLE (beta_cap), we should have: score(beta_cap) ≈ 0    (within numerical precision)
+# This implies that, **globally and within each covariate pattern / risk class**, 
+# the **observed total claims (sum Y)** ≈ **expected total claims (sum μ)**.
 # design matrix and response
 matrix.num.X <-model.matrix(model.pois)
 vec.num.Y <- model.response(model.frame(model.pois))
