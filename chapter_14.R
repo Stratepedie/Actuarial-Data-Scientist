@@ -169,47 +169,103 @@ summary(model.pois)
 # Fisher Scoring iterations = 6, Convergence was fast and stable, this means no numerical issues with the IRLS algorithm.
 # IRLS stands for Iteratively Reweighted Least Squares.
 
+# ---------------------------------------------------------------------
+# design matrix and response
+#----------------------------------------------------------------------
+
 # In Poisson GLM (log-link + offset(log(exposure))), the MLE estimator beta_cap satisfies the score equations = 0 at convergence.
 # The score vector (gradient of the log-likelihood) is:
 #   score(beta) = X' (Y - mu)   where mu = exp(X*beta + offset) = fitted values
 # At the MLE (beta_cap), we should have: score(beta_cap) ≈ 0    (within numerical precision)
-# This implies that, **globally and within each covariate pattern / risk class**, 
-# the **observed total claims (sum Y)** ≈ **expected total claims (sum μ)**.
-# design matrix and response
-matrix.num.X <-model.matrix(model.pois)
-vec.num.Y <- model.response(model.frame(model.pois))
-# fitted mean mu (vector)
-vec.num.mu <- fitted(model.pois)
-# Score (gradient) at MLE
-vec.num.score <- t(matrix.num.X) %*% (vec.num.Y - vec.num.mu)         # p x 1 vector
-vec.num.score 
-# The score equations are satisfied for all rating factors, meaning that at the estimated parameters,
-# observed and expected claims are fully balanced within each risk class.
-# Observed Hessian
-##############################################################################################################
-# matrix.num.W <- diag(as.numeric(vec.num.mu))
-# matrix.num.H <- - t(matrix.num.X) %*% matrix.num.W %*% matrix.num.X           # p x p matrix (negative definite)
-# Fehler: cannot allocate vector of size 1271.9 Gb -> diag(as.numeric(vec.num.mu)) is a n × n dense matrix
-# and n = 413,169 is too large. Alternativ, instead of WX = W%*%X we compute WX = X*mu
-##############################################################################################################
-matrix.num.H<- - t(matrix.num.X) %*% (matrix.num.X * as.numeric(vec.num.mu))
-matrix.num.Info<- -matrix.num.H
-matrix.num.Info
-vcov_manual <- solve(matrix.num.Info)       # (X' W X)^{-1}
-SE_manual    <- sqrt(diag(vcov_manual))     # standard errors are the square roots of its diagonal
-data.frame(Estimate = coef(model.pois),
-           SE_manual = SE_manual,
-           SE_summary = summary(model.pois)$coefficients[, "Std. Error"])
-# check differences
-max(abs(SE_manual - summary(model.pois)$coefficients[, "Std. Error"]))
+# This implies that, globally and within each covariate pattern / risk class, 
+# the observed total claims (sum Y) ≈ expected total claims (sum mu).
 
+# In other words: the model is balanced. It does not systematically over- or under-predict the number of claims
+# in any combination of rating factors (GAS, AGEDRIVER, DENSITY, etc.). This balance property is a direct
+# consequence of the first-order conditions of MLE and is very important for actuarial credibility
+# and fairness in a priori ratemaking.
+
+# ---------------------------------------------------------------------
+# Code to verify this property empirically
+#----------------------------------------------------------------------
+
+# Design matrix (without intercept column if you want, but usually include it)
+matrix.num.X <- model.matrix(model.pois)           # n × p matrix
+
+# Observed response vector (number of claims Y_i)
+vec.num.Y <- model.response(model.frame(model.pois))  # n × 1
+
+# Fitted values mu_i = exp(X*beta_cap + log(E_i))
+vec.num.mu <- fitted(model.pois)                   # n × 1
+
+# Score vector at MLE (should be ≈ 0 for each component)
+vec.num.score <- crossprod(matrix.num.X, vec.num.Y - vec.num.mu)   # p × 1
+
+# Print it (very small values = good convergence)
+print(vec.num.score)
+round(vec.num.score, 8)   # easier to read
+
+# Quick check: are all components numerically zero?
+all(abs(vec.num.score) < 1e-6)    # should return TRUE
+
+# ---------------------------------------------------------------------
+# Observed (Expected) Information / Hessian computation
+# ---------------------------------------------------------------------
+
+# In Poisson GLM, the observed Hessian H(beta_cap) = - X' W X   (negative second derivative of log-likelihood)
+#   implies W = diag(mu_i)   since for Poisson, variance = mu_i and 
+#   the second derivative of the log-likelihood with respect to beta = -mu_i X X'
+#
+# At MLE, the Fisher Information matrix I(beta_cap) ≈ -H(beta_cap) = X' W X
+#   -> Its inverse I^{-1} gives the asymptotic covariance matrix of beta_cap
+#   -> Diagonal elements -> variances -> standard errors = sqrt(variance)
+#
+# Goal here: Verify that we can recover the same standard errors as glm() summary()
+#            -> proves numerical understanding of GLM inference
+#            -> useful for custom models, bootstrap alternatives, or large-scale implementations
+#
+# Problem: n = 413,169 observations -> diag(mu) would be n×n dense matrix ≈ 1,272 GB (!) -> impossible
+# Solution: Avoid building full diag(W) -> compute X' W X = X' (mu .* X) = t(X) %*% (X * mu)
+#           -> memory-efficient (only uses X and mu vectors)
+
+# Efficient computation of -Hessian = Information matrix
+matrix.num.H    <- - crossprod(matrix.num.X, matrix.num.X * as.numeric(vec.num.mu))   # p×p
+matrix.num.Info <- - matrix.num.H                                                     # = X' W X ≈ Fisher Information
+matrix.num.Info
+# Asymptotic covariance matrix = inverse of Information
+vcov_manual <- solve(matrix.num.Info)
+
+# Manual standard errors
+SE_manual <- sqrt(diag(vcov_manual))
+
+# Compare with glm() built-in standard errors
+comparison <- data.frame(
+  Estimate   = coef(model.pois),
+  SE_manual  = SE_manual,
+  SE_glm     = summary(model.pois)$coefficients[, "Std. Error"]
+)
+
+print(comparison)
+max_diff <- max(abs(SE_manual - summary(model.pois)$coefficients[, "Std. Error"]))
+cat("Maximum absolute difference between manual and glm SE:", max_diff, "\n")
+# -> Should be extremely small (e.g. < 1e-10) if computation is correct
+
+# ---------------------------------------------------------------------
+# Interpretation of standard errors / credibility insight
+# ---------------------------------------------------------------------
+
+# Smaller standard error => more precise estimate => higher "credibility" for that coefficient
+#   (i.e. narrower confidence interval, more reliable effect size)
+#
 # looking at the diagonal of matrix.num.Info, one can say that, GasRegular, age 42–74 and high-density zones have 
 # high credibility; very old drivers have low credibility.
+
+
+## 14.2.3 Ratemaking with One Categorical Variable
 
 # In the following sections, we will discuss the interpretation of this regression, on categorical
 # variables (one or two) and on continuous variables (one or two).
 
-## 14.2.3 Ratemaking with One Categorical Variable
 ##
 vec.factor.gas.X1<-df.contract$Gas
 name.vec.factor.gas.X1<-levels(vec.factor.gas.X1)
