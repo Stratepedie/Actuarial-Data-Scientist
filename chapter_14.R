@@ -1,7 +1,62 @@
 
 ####################################################################################
-############################### Chapter 14 #########################################
+#################### Chapter 14: General Insurance Pricing #########################
 ####################################################################################
+
+#The goal is to propose a premium that an insurance company should charge a
+#client, for a yearly contract, based on a series of characteristics of the: 
+#driver, such as the age or the region, or 
+#car, such as the power, the make, or the type of gas.
+
+## 14.1 Introduction and Motivation
+
+## 14.1.1 Collective Model in General Insurance
+
+# most common formula are given by:
+
+# premium = (1 + alpha) * expected_loss or π = (1 + α) × E[S],  with α ≥ 0.
+
+# α (alpha) = loading factor / markup / safety loading
+# α = 0  means pure premium (theoretical break-even, usually leads to ruin)
+# α > 0  means includes margin for profit + uncertainty + expenses + ruin protection
+
+# Pure premium in a Homogeneous Context:
+#   π = E[S] = E[N] × E[Y] , ((Annual) claims frequency × Average cost of individual claims)
+# where
+#   N  = number of claims in one year (claim frequency)
+#   Y  = individual claim amount (average severity)
+#   S  = total annual loss = sum_{i=1}^N Y_i
+
+## 14.1.2 Pure Premium in a Heterogenous Context:
+
+# With observable Z (low/high risk):
+#   Charging the same premium for everyone creates adverse selection:
+#   Low risks switch to competitors, high risks stay, company collapses.
+
+# risk-differentiated pure premium: π(z) = E[S | Z=z] = E[N | Z=z] × E[Y | Z=z]
+
+# In practice: Z is not directly observable, but we observe covariates X (age, car type, etc.)
+
+# Predictive premium becomes: π(x) = E[S | X=x] = E[N | X=x] × E[Y | X=x]
+
+# Chapter goal: Build predictive models for pure premium components in heterogeneous portfolios
+
+# Target quantities to predict (given policyholder covariates x):
+
+# 1. Expected claim frequency (annualized): lambda(x) = E[N | X = x]    # number of claims per year
+
+# 2. Expected claim severity: mu(x) = E[Y | X = x]    # average cost per claim
+
+# Then the individualized pure premium is: pi(x) = lambda(x) * mu(x) = E[S | X = x]
+
+# Typical models used:
+#   - Frequency (N): Poisson / NB / Zero-inflated models (glm, glm.nb, gamlss, ...)
+#   - Severity (Y):  Gamma / LogNormal / Inverse Gaussian (glm(..., family = Gamma(link="log")), ...)
+
+## 14.1.3 Dataset
+
+#The CONTRACTS dataset has French motor insurance data (ID, claims count NB, exposure, 
+#car power/age/brand, driver age, fuel, region, density); CLAIMS links by ID with claim costs (INDEMNITY).
 
 ## 14.2.1 Annualized Claims Frequency
 
@@ -26,15 +81,15 @@ df.contract$Density<-cut(df.contract$Density,c(0,40,200,500,4500,Inf),include.lo
 # We compute the average annualized frequency and its empirical variance
 
 vec.int.vY<-df.contract$ClaimNb   # returns the vector of claims with discrete value (0,1,2,3,4)
-int.agg.claims <- aggregate(df.contract$ClaimNb, # we aggregate the claims for each discrete value
-                        by = list(ClaimNb = df.contract$ClaimNb),
-                        FUN = length)
+int.agg.claims <- aggregate(vec.int.vY, 
+                        by = list(ClaimNb = vec.int.vY),
+                        FUN = length)  # we aggregate the claims for each discrete value
 
 colnames(int.agg.claims)[2] <- "Count"
 int.agg.claims  # returns the number of claims for each discrete value 
 
 vec.num.vE<-df.contract$Exposure  # returns the numeric vector of Exposure with value in (0-2)
-boxplot(df.contract$Exposure,
+boxplot(vec.num.vE,
         main="Boxplot of Exposure",
         col="grey")
 
@@ -74,25 +129,45 @@ vec.num.w <- vec.num.E/sum(vec.num.E)  # return the vector of the weights w_i
 (num.lambda<-weighted.mean(vec.int.Y/vec.num.E,vec.num.w)) # compute lambda directly with the function in R
 
 # The difference between the annualized Claims Frequency in 14.2.1 and lambda in 14.2.2 is due to the fact that
-# the authors used another dataset named CONSTRACTS instead of CONTRACTS.
+# the authors used another dataset named CON(S)TRACTS instead of CONTRACTS as from the beginning.
 
 # Given the the estimated annual claim frequency parameter lambda, we can now use the the Poisson model to predicts
 # probabilities for 0,1,2,3 and 4 claims (in %)
 
-dpois(0:4, num.lambda)*100 # in the Book probabilities for 0,1,2 and 3
+dpois(0:4, num.lambda)*100 # in the Book only the probabilities for 0,1,2 and 3 are given
 
-# The result matches real insurance portfolios: Most policyholders never claim, a few claim once, very few claim twice
+# The result matches real insurance portfolios for this short periode of time 2 years: 
+# Most policyholders never claim, a few claim once, very few claim twice
+
+# The following shows how to estimate the true annual claim frequency lambda_i (varying by covariates for individualized pricing) 
+# using a Poisson GLM on observed claims Y_i, by adding log(exposure) as an offset (fixed coefficient = 1)
 
 formula<- ClaimNb~Gas+DriverAge+Density+offset(log(vec.num.E))
 funct.link<-poisson(link="log")
-
+                                                                                                                                                                            
 model.pois<-glm(formula,family=funct.link,data=df.contract)
 summary(model.pois)
 
-# The intercept estimate = −1.86471. This is the baseline annual frequency ist given by exp(-1.86471)≈ 0.155. This
-# means about 0.155 claims/year for the reference profile. Regular gas vehicles have ~19% lower frequency than 
-# the reference fuel type. Frequency decreases strongly with age. Claim frequency almost doubles in very dense areas
-# Statistical significance: All covariates: p < 5.02e−12, Effects are highly credible actuarially
+# Baseline (reference profile = Diesel): Intercept only, lambda_ref = exp(Intercept) = exp(-1.86471) approx. 0.1549 claims per year
+# means about 15.5 claims per 100 policy in a years. GasRegular (vs. reference = Diesel) Coefficient beta_GasRegular = -0.20598
+# Multiplicative factor = exp(beta_GasRegular) = exp(-0.20598) approx. 0.8138. This imply that Regular gas vehicles have approx.81.4% 
+# of the frequency of diesel vehicles: Reduction of approx. 18.6% (computed as 1 - exp(beta_GasRegular) approx. 0.186).
+# Driver age groups (vs. reference category, usually the youngest: (17,22]). beta_Age(22,26]= -0.61606, exp(betaAge(22,26]) approx. 0.540, 
+# this correspond to the relative reduction of 1-exp(betaAge(22,26])= 1-0.540 approx. 46% lower. Strong protective effect of age: frequency 
+# drops sharply after approx. 22 and stays low. Population density (vs. reference = lowest category [0,40)). All positive coefficients imply 
+# that higher density = higher frequency (risk-increasing). beta_Density([40,200))= 0.18473, exp(beta_Density([40,200))) approx. 1.203
+# the relative increase = exp(0.18473) -1 approx. +20.3%. Claim frequency nearly doubles in the densest urban areas vs. rural/low-density
+
+# example: full prediction for a high-risk profile: Young driver (17-22], Diesel, very dense area (>4500 inhab/km²)
+# eta = Intercept + 0*(age) + 0*(gas) + 0.63717*(density) = -1.86471 + 0 + 0 + 0.63717 approx. -1.2275
+# lambda= = exp(-1.2275) approx. 0.293 claims/year approx. 29.3 claims per 100 policy-years
+
+# Dispersion parameter = 1: The model assumes no overdispersion (variance = mean, as required for a pure Poisson distribution)
+# Deviance drop = 105613 − 103986 = 1627, The covariates explain 1627 units of deviance. Adding these risk factors 
+# (GAS, age groups, density) genuinely improves our ability to separate high-risk from low-risk drivers for fair pricing.
+# AIC = 135263 Lower AIC = better model fit (penalizing complexity). we come to this later to compare against alternative models
+# Fisher Scoring iterations = 6, Convergence was fast and stable, this means no numerical issues with the IRLS algorithm.
+# IRLS stands for Iteratively Reweighted Least Squares.
 
 # design matrix and response
 matrix.num.X <-model.matrix(model.pois)
