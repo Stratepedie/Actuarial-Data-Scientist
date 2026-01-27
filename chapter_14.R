@@ -1,7 +1,7 @@
 
-####################################################################################
-#################### Chapter 14: General Insurance Pricing #########################
-####################################################################################
+##########################################################################################################################################
+############################################### Chapter 14: General Insurance Pricing ####################################################
+##########################################################################################################################################
 
 # The goal is to propose a premium that an insurance company should charge a
 # client, for a yearly contract, based on a series of characteristics of the: 
@@ -169,9 +169,9 @@ summary(model.pois)
 # Fisher Scoring iterations = 6, Convergence was fast and stable, this means no numerical issues with the IRLS algorithm.
 # IRLS stands for Iteratively Reweighted Least Squares.
 
-# ---------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------------------------------
 # design matrix and response
-#----------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------------------------------
 
 # In Poisson GLM (log-link + offset(log(exposure))), the MLE estimator beta_cap satisfies the score equations = 0 at convergence.
 # The score vector (gradient of the log-likelihood) is:
@@ -185,9 +185,9 @@ summary(model.pois)
 # consequence of the first-order conditions of MLE and is very important for actuarial credibility
 # and fairness in a priori ratemaking.
 
-# ---------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------------------------------------------------------------
 # Code to verify this property empirically
-#----------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------------------------------------------------------------
 
 # Design matrix (without intercept column if you want, but usually include it)
 matrix.num.X <- model.matrix(model.pois)           # n × p matrix
@@ -208,9 +208,9 @@ round(vec.num.score, 8)   # easier to read
 # Quick check: are all components numerically zero?
 all(abs(vec.num.score) < 1e-6)    # should return TRUE
 
-# ---------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------------------------------------------------------
 # Observed (Expected) Information / Hessian computation
-# ---------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------------------------------------------------------
 
 # In Poisson GLM, the observed Hessian H(beta_cap) = - X' W X   (negative second derivative of log-likelihood)
 #   implies W = diag(mu_i)   since for Poisson, variance = mu_i and 
@@ -229,6 +229,9 @@ all(abs(vec.num.score) < 1e-6)    # should return TRUE
 #           -> memory-efficient (only uses X and mu vectors)
 
 # Efficient computation of -Hessian = Information matrix
+#---------------------------------------------------------------------------------------------------------------------------------------------------
+# Code to verify this property empirically
+#---------------------------------------------------------------------------------------------------------------------------------------------------
 matrix.num.H    <- - crossprod(matrix.num.X, matrix.num.X * as.numeric(vec.num.mu))   # p×p
 matrix.num.Info <- - matrix.num.H                                                     # = X' W X ≈ Fisher Information
 matrix.num.Info
@@ -250,9 +253,9 @@ max_diff <- max(abs(SE_manual - summary(model.pois)$coefficients[, "Std. Error"]
 cat("Maximum absolute difference between manual and glm SE:", max_diff, "\n")
 # -> Should be extremely small (e.g. < 1e-10) if computation is correct
 
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------------------------------------------
 # Interpretation of standard errors / credibility insight
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------------------------------------------
 
 # Smaller standard error => more precise estimate => higher "credibility" for that coefficient
 #   (i.e. narrower confidence interval, more reliable effect size)
