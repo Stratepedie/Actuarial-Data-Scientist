@@ -3,8 +3,8 @@
 ############################################### Chapter 14: General Insurance Pricing ####################################################
 ##########################################################################################################################################
 
-# The goal is to propose a premium that an insurance company should charge a
-# client, for a yearly contract, based on a series of characteristics of the: 
+# The goal is to propose a premium that an insurance company should charge a client, for a yearly contract, based on a series of 
+# characteristics of the:
 # driver, such as the age or the region, or 
 # car, such as the power, the make, or the type of gas.
 
@@ -55,8 +55,8 @@
 
 ## 14.1.3 Dataset
 
-#The CONTRACTS dataset has French motor insurance data (ID, claims count NB, exposure, 
-#car power/age/brand, driver age, fuel, region, density); CLAIMS links by ID with claim costs (INDEMNITY).
+# The CONTRACTS dataset has French motor insurance data (ID, claims count NB, exposure, car power/age/brand, driver age, 
+# fuel, region, density); CLAIMS links by ID with claim costs (INDEMNITY).
 
 ## 14.2.1 Annualized Claims Frequency
 
@@ -71,8 +71,8 @@ df.contract<-freMTPLfreq
 df.claims<-freMTPLsev
 str(df.contract) # we describe the size of the dataset as well as its variables.
 
-# We cut continuous variables to define factor because this simplifies interpretation, 
-# stabilizes GLM estimates, and better captures nonlinear risk patterns in insurance data.
+# We cut continuous variables to define factor because this simplifies interpretation, stabilizes GLM estimates,
+# and better captures nonlinear risk patterns in insurance data.
 
 df.contract$DriverAge<-cut(df.contract$DriverAge,c(17,22,26,42,74,Inf))
 df.contract$CarAge<-cut(df.contract$CarAge,c(0,1,4,15,Inf),include.lowest=T)
@@ -267,36 +267,129 @@ cat("Maximum absolute difference between manual and glm SE:", max_diff, "\n")
 ## 14.2.3 Ratemaking with One Categorical Variable
 
 # In the following sections, we will discuss the interpretation of this regression, on categorical
-# variables (one or two) and on continuous variables (one or two).
+# variables (one or two) and on continuous variables (one or two). The primary motivation is to illustrate 
+# how a single categorical explanatory variable (here, the type of gas: Diesel or Regular) can be incorporated 
+# into a Poisson GLM to estimate and predict annualized claim frequencies, accounting for exposure (e.g., time the policy is active).
 
-##
 vec.factor.gas.X1<-df.contract$Gas
 name.vec.factor.gas.X1<-levels(vec.factor.gas.X1)
-#  The number of claims per gas type is
-tapply(vec.int.vY, vec.factor.gas.X1, sum)
-# and the annualized claim frequency is
-tapply(vec.int.vY, vec.factor.gas.X1, sum)/tapply(vec.num.vE, vec.factor.gas.X1, sum)
+tapply(vec.int.vY, vec.factor.gas.X1, sum)       #  The number of claims per gas type
 
-# Now we take a look at the Poisson regression without the (Intercept) variable. This is done
-# by Removing the intercept to makes each coefficient a group-specific frequency levels, therefore
-# Each level of X1 (fuel type) gets its own parameter,there is no baseline category.
+tapply(vec.int.vY, vec.factor.gas.X1, sum)/tapply(vec.num.vE, vec.factor.gas.X1, sum) # the annualized claim frequency
+
+# Diesel cars have a higher claim frequency (0.075) than Regular (0.065), suggesting Diesel might carry higher risk 
+# (e.g., due to vehicle type, usage patterns, or demographics). In a company: Cross-check these with business context—e.g., 
+# is this due to more Diesel vehicles being commercial trucks? If frequencies differ significantly, it justifies segmenting 
+# premiums by gas type to avoid adverse selection (low-risk customers subsidizing high-risk ones).
+# Note: Exposure adjustment is crucial; raw claim counts ignore policy duration. Without the offset(log(vec.num.vE)), models would 
+# overestimate frequencies for longer-exposed policies.
+
+
+# Now we take a look at the Poisson regression without the (Intercept) variable. This is done by Removing the intercept to makes each
+# coefficient a group-specific frequency levels, therefore each level of X1 (fuel type) gets its own parameter,there is no baseline category.
 
 df.contract.gas <- data.frame(vec.int.vY,vec.num.vE,vec.factor.gas.X1)
-
 formula.0<- vec.int.vY~0+vec.factor.gas.X1+offset(log(vec.num.E))
 funct.link<-poisson(link="log")
 
 model.pois.gas.0<-glm(formula.0,family=funct.link,data=df.contract.gas)
 summary(model.pois.gas.0)
-exp(coefficients(model.pois.gas.0)) # we view the observed annualized frequencies, per gas type.
+exp(coefficients(model.pois.gas.0)) # with the exponents of coefficients we view the observed annualized frequencies, per gas type.
 
-# In sum, this model is equivalent to a pure premiums table grouped by fuel type. The beta for Diesel which is equal
-# to the log(frequency of Diesel) is given by beta_Diesel= −2.59462 therefore  the frequency of Diesel is given
-# by frequency_Diesel= exp(−2.59462)≈ 0.0747. This means that the estimated claim frequency for Diesel is about 
-# 7.47% per year (i.e., 0.0747 claims per exposure unit).
+# In sum, this model is equivalent to a pure premiums table grouped by fuel type. The beta for Diesel which is equal to the 
+# log(frequency of Diesel) is given by beta_Diesel= −2.59462 therefore  the frequency of Diesel is given
+# by frequency_Diesel= exp(−2.59462) approx. 0.0747. This means that the estimated claim frequency for Diesel is about 
+# 7.47% per year (i.e., 0.0747 claims per exposure unit). by analogy the frequency_Regular is approx. 0.065.
+
+# Refits with intercept, making one category (Diesel) the reference.
+
+df.contract.gas <- data.frame(vec.int.vY,vec.num.vE,vec.factor.gas.X1)
+formula.ref<- vec.int.vY~vec.factor.gas.X1+offset(log(vec.num.E))
+funct.link<-poisson(link="log")
+
+model.pois.gas.ref<-glm(formula.ref,family=funct.link,data=df.contract.gas)
+summary(model.pois.gas.ref)
+exp(coefficients(model.pois.gas.ref))
+
+# The exponent of the intercept (~0.075) gives the baseline annualized claim frequency for the reference category (Diesel). 
+# The coefficient for Regular gas (-0.136) indicates a lower log-frequency; when exponentiated (exp(-0.136) approx. 0.873), 
+# it acts as a multiplicative factor. Thus:  
+# Regular frequency = Diesel frequency × 0.873 ≈ 0.065. Equivalently, Regular gas is associated with an approximately 12.7%
+# lower claim frequency compared to Diesel (calculated as 1 − exp(-0.136) ≈ 0.127, or 12.7%).
+# Assumptions and Limitations: Poisson assumes mean=variance and independence; insurance data often violates this 
+# (e.g., multiple claims per policy). In a company, scale to multiple variables (e.g., add age, region) for full ratemaking.
+# Business Implications: Interpretations drive decisions—higher Diesel frequency might lead to targeted premiums, marketing 
+# (e.g., discounts for Regular), or risk management (e.g., investigate why Diesel claims are higher).
+
+## 14.2.4 Contingency Tables and Minimal Bias Techniques
+
+# Now we moves from one factor to two categorical factors simultaneously (Gas × Density), creating a full two-way contingency  
+# table of observed claims, exposure, and empirical frequencies (N = Y/E).
+
+vec.factor.density.X2<-df.contract$Density
+name.vec.factor.gas.X1<-levels(vec.factor.gas.X1)
+name.vec.factor.density.X2<-levels(vec.factor.density.X2)
+(table.P=table(vec.factor.gas.X1,vec.factor.density.X2))    
+
+table.E<-table.Y<-table.P
+for(k in 1:length(name.vec.factor.gas.X1)){
+  table.E[k,]<-tapply(vec.num.vE[vec.factor.gas.X1==name.vec.factor.gas.X1[k]],vec.factor.density.X2[vec.factor.gas.X1==name.vec.factor.gas.X1[k]],sum)
+  table.Y[k,]<-tapply(vec.int.vY[vec.factor.gas.X1==name.vec.factor.gas.X1[k]],vec.factor.density.X2[vec.factor.gas.X1==name.vec.factor.gas.X1[k]],sum)}
+
+# Theannualized(empirical)claimsfrequencyisthen
+
+(table.N <- table.Y/table.E)
+
+# Now the vectors L = [L_i] (row relativities, here for Gas types: Diesel and Regular) and C = [C_j] (column relativities, here for Density bands) are 
+# will be constructed to fit a multiplicative model for the empirical annualized claim frequencies:N_(i,j) ≈ L_i × C_j.
+# where N_(i,j) = Y_(i,j) / E_(i,j) is the observed frequency in cell (i,j) (Gas i × Density j).
+
+matrix.L<-matrix(NA,100,length(name.vec.factor.gas.X1))
+matrix.C<-matrix(NA,100,length(name.vec.factor.density.X2))
+matrix.C[1,]<-rep(sum(vec.int.vY)/sum(vec.num.vE),length(name.vec.factor.density.X2));colnames(matrix.C)<-name.vec.factor.density.X2
+for(j in 2:100){
+   for(k in 1:length(name.vec.factor.gas.X1)) matrix.L[j,k]<-sum(table.Y[k,])/sum(table.E[k,]*matrix.C[j-1,])
+   for(k in 1:length(name.vec.factor.density.X2)) matrix.C[j,k]<-sum(table.Y[,k])/sum(table.E[,k]*matrix.L[j,])}
+
+# we obtain the following values for L and C:
+matrix.L[100,]
+matrix.C[100,]
+# The predict annualized Claim frequency is
+
+table.PredN=table.N
+ for(k in 1:length(name.vec.factor.gas.X1)) table.PredN[k,]<-matrix.L[100,k]*matrix.C[100,]
+table.PredN
+
+# Given the observed exposure, the prediction of the number of claims for Diesel cars (for instance) with this model would be
+sum(table.PredN[1,]*table.E[1,])
+
+# 14.2.5 Ratemaking with Continuous Variables
+
+# In modern non-life insurance especially in motor markets are extremely competitive and customers are price-sensitive.
+# Using arbitrary cut-points for age, car age, bonus-malus level, etc. introduces unnecessary discontinuities, wastes statistical 
+# power, and leaves money on the table (or creates anti-selection). Keeping (key) rating factors continuous (possibly smoothed via 
+# splines/GAM) usually gives a better, fairer, and more competitive tariff while still being explainable with relativities or rate charts at selected ages.
+
+# The standard regression on the age of the driver with the continue Variables transformed in the categorical would yield
+formula.cut<- ClaimNb~DriverAge+offset(log(vec.num.E))
+funct.link<-poisson(link="log")
+
+model.pois.cut<-glm(formula.cut,family=funct.link,data=df.contract) # data=df.contract with continuous variables converted to categorical factors.
+summary(model.pois.cut)
+
+# The standard regression on the age of the driver would yield
+formula.st<- ClaimNb~DriverAge+offset(log(vec.num.E))
+funct.link<-poisson(link="log")
+
+model.pois.st<-glm(formula.st,family=funct.link,data=freMTPLfreq) # data=freMTPLfreq with continuous variables.
+summary(model.pois.st)
 
 
-
-
+newdb <- data.frame(DriverAge=18:99,vec.num.E=1)
+pred.model.pois.st <- predict(model.pois.st,newdata=newdb,type="response",se=TRUE)
+plot(18:99,pred.model.pois.st$fit,type="l",xlab="Age of the driver",ylab="Annualized Frequency", ylim=c(0,.3),col="white")
+segments(18:99,pred.model.pois.st$fit-2*pred.model.pois.st$se.fit,18:99,pred.model.pois.st$fit+2*pred.model.pois.st$se.fit,col="grey",lwd=7)
+lines(18:99,pred.model.pois.st$fit)
+abline(h=sum(df.contract$ClaimNb)/sum(df.contract$Exposure),lty=2)
 
 
