@@ -114,37 +114,6 @@ ggplot(full_r5 %>% filter(!is.na(risk_score), !is.na(bought_ibli)),
         axis.text.x = element_text(angle = 30, hjust = 1))  
 # Viz 3: Premium vs Coverage, colored by payout (ties to "Kenyan Cowboy Story")
 
-full_r5 <- full_r5 %>%
-  mutate(s15q19_2 = suppressWarnings(as.numeric(s15q19_2))) %>%
-  filter(!is.na(s15q19_2), !is.na(s15q22))
-
-# Now create the plot
-ggplot(full_r5, aes(x = s15q19_2, y = s15q22, color = received_payout)) +
-  geom_point(size = 2, alpha = 0.7) +  # Reduced point size for clarity
-  scale_color_manual(values = c("Yes" = "#33a02c", "No" = "#e31a1c")) +
-  scale_x_continuous(
-    breaks = seq(min(full_r5$s15q19_2), max(full_r5$s15q19_2), by = 5000),  # Adjust the 'by' value for spacing
-    labels = scales::comma  # Format labels as commas (optional, for clarity)
-  ) +
-  labs(
-    title = "IBLI Premium vs Animals Covered",
-    subtitle = "Points colored by payout received | NDVI triggers in Marsabit",
-    x = "Premium (in Kenyan Shillings - KES)",
-    y = "Animals Covered",
-    color = "Payout Received?"
-  ) +
-  theme_minimal(base_size = 10) +  # Smaller base size for a compact look
-  theme(
-    legend.position = "bottom",  # Move legend to bottom
-    legend.title = element_text(size = 8),  # Adjust legend title size
-    legend.text = element_text(size = 7),  # Adjust legend text size
-    axis.text = element_text(size = 8),  # Smaller axis text
-    axis.title = element_text(size = 9),  # Slightly smaller axis titles
-    plot.title = element_text(size = 11, face = "bold"),  # Make title slightly smaller and bold
-    plot.subtitle = element_text(size = 9)  # Smaller subtitle
-  )
-
-
 ggplot(full_r5 %>%
          mutate(s15q19_2 = suppressWarnings(as.numeric(s15q19_2))) %>%
          filter(!is.na(s15q19_2), !is.na(s15q22)),
