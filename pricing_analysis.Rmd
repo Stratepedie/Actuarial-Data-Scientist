@@ -1,0 +1,792 @@
+---
+title: "Product Management: Pricing"
+subtitle: "Pricing Techniques in Insurance — When Damage/Loss Histories Are Unavailable"
+author: "Stratepedie"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 12,
+  fig.height = 6
+)
+```
+
+---
+
+# Packages
+
+```{r packages}
+# Install (run once)
+# install.packages(c("recipes", "keras", "gridExtra", "catboost", "lightgbm",
+#                    "xgboost", "caret", "Metrics"))
+# devtools::install_github('catboost/catboost', subdir = 'catboost/R-package')
+
+library(tidyverse)
+library(tidygeocoder)
+library(dplyr)
+library(gridExtra)
+library(stringr)
+library(purrr)
+library(reshape2)
+library(ggplot2)
+library(tidyr)
+library(corrplot)
+library(patchwork)
+library(magick)
+library(recipes)
+library(keras)
+library(catboost)
+library(lightgbm)
+library(xgboost)
+library(caret)
+library(Metrics)
+```
+
+---
+
+# Data Quality Control & Cleaning
+
+## Import & Overview
+
+```{r import-data}
+contract <- read_csv("housing_with_county_and_sample.csv")
+set.seed(2026)
+
+cat("Dataset overview:\n")
+cat(sprintf("Rows:    %d\n", nrow(contract)))
+cat(sprintf("Columns: %d\n", ncol(contract)))
+cat("\nRandom sample of 7 rows:\n")
+contract %>%
+  slice_sample(n = 7) %>%
+  print()
+```
+
+## Structure & Data Types
+
+```{r structure}
+str(contract)
+sapply(contract, class)
+sapply(contract, function(x) is.numeric(x) && any(x %% 1 != 0, na.rm = TRUE))
+```
+
+## Missing Values
+
+```{r missing-values}
+any(is.na(contract))
+cat(sprintf("Contract has the following number of missing values: %d\n", sum(is.na(contract))))
+
+missing_per_col <- colSums(is.na(contract))
+for (col_name in names(missing_per_col)) {
+  cat(sprintf("Column %-20s has %d missing values\n", col_name, missing_per_col[col_name]))
+}
+```
+
+> With the exception of `ocean_proximity`, `county_name`, and `sample`, all features were identified as numeric.
+> The variables `latitude`, `longitude`, and `median_income` contain decimal values.
+> `total_bedrooms` has 207 missing values; `county_name` has 3 missing values.
+
+## Train / Validation / Test Split
+
+```{r split}
+table(contract$sample)
+
+total_number_of_rows <- nrow(contract)
+number_of_group_A    <- sum(contract$sample == "A")
+number_of_group_B    <- sum(contract$sample == "B")
+number_of_group_C    <- sum(contract$sample == "C")
+
+percent_A <- round((number_of_group_A / total_number_of_rows) * 100)
+percent_B <- round((number_of_group_B / total_number_of_rows) * 100)
+percent_C <- round((number_of_group_C / total_number_of_rows) * 100)
+
+print(paste("Train: ", percent_A, "%"))
+print(paste("Valid: ", percent_B, "%"))
+print(paste("Test:  ", percent_C,  "%"))
+```
+
+## Numeric Summary
+
+```{r numeric-summary}
+numeric <- contract[sapply(contract, is.numeric)]
+print("Basic summary:")
+print(summary(numeric))
+```
+
+---
+
+# Outlier & Missing Value Analysis
+
+## Boxplot & Histogram of `total_bedrooms`
+
+```{r total-bedrooms-plots, fig.height=5}
+daten      <- contract$total_bedrooms
+median_wert <- median(daten, na.rm = TRUE)
+
+par(mfrow = c(1, 2), mar = c(5, 4, 4, 2))
+
+boxplot(daten,
+        horizontal = TRUE,
+        main       = "Boxplot of total_bedrooms",
+        xlab       = "Values of total_bedrooms",
+        col        = "lightblue",
+        border     = "darkblue",
+        outpch     = 19,
+        outcol     = "gray50",
+        whisklty   = 1,
+        medcol     = "red",
+        cex.main   = 1.2)
+
+hist(daten,
+     breaks = 50,
+     main   = "Histogram of total_bedrooms with median",
+     xlab   = "Values of total_bedrooms",
+     ylab   = "Number of observations",
+     col    = "lightblue",
+     border = "darkblue")
+
+abline(v = median_wert, col = "red", lwd = 2, lty = 2)
+```
+
+> `total_bedrooms` is right-skewed and highly dispersed — the mean is not well suited for imputation.
+
+## Examining Rows with Missing `total_bedrooms`
+
+```{r missing-bedrooms-analysis}
+total_bedrooms_null <- contract[is.na(contract$total_bedrooms), ]
+
+median_bedrooms <- median(contract$total_bedrooms, na.rm = TRUE)
+cat("Median of total_bedrooms:", median_bedrooms, "\n")
+
+max_rooms_without_bedrooms <- max(total_bedrooms_null$total_rooms, na.rm = TRUE)
+cat("Maximum of total_rooms without total_bedrooms:", max_rooms_without_bedrooms, "\n")
+
+min_rooms_without_bedrooms <- min(total_bedrooms_null$total_rooms, na.rm = TRUE)
+cat("Minimum of total_rooms without total_bedrooms:", min_rooms_without_bedrooms, "\n")
+
+# Extreme rows
+min_rooms   <- min(total_bedrooms_null$total_rooms, na.rm = TRUE)
+max_rooms   <- max(total_bedrooms_null$total_rooms, na.rm = TRUE)
+extreme_rows <- total_bedrooms_null[
+  total_bedrooms_null$total_rooms == min_rooms |
+    total_bedrooms_null$total_rooms == max_rooms, ]
+print(extreme_rows)
+```
+
+## Scatter Plot: `total_rooms` vs `total_bedrooms`
+
+```{r scatter-rooms-bedrooms, fig.height=5}
+plot(
+  x          = contract$total_rooms,
+  y          = contract$total_bedrooms,
+  main       = "Comparison of total_rooms and total_bedrooms",
+  xlab       = "total_rooms",
+  ylab       = "total_bedrooms",
+  pch        = 19,
+  cex        = 0.6,
+  col        = rgb(0, 0, 0.6, 0.5),
+  panel.first = grid()
+)
+```
+
+---
+
+# Imputation via `room_quotient`
+
+## Calculate Quotient & Impute
+
+```{r imputation}
+contract$room_quotient <- contract$total_bedrooms / contract$total_rooms
+
+mean_room_quotient <- mean(contract$room_quotient, na.rm = TRUE)
+cat("Mean room_quotient:", mean_room_quotient, "\n")
+
+# Impute missing total_bedrooms
+contract$total_bedrooms[is.na(contract$total_bedrooms)] <-
+  mean_room_quotient * contract$total_rooms[is.na(contract$total_bedrooms)]
+
+cat("Still missing bedrooms:", sum(is.na(contract$total_bedrooms)), "\n")
+```
+
+## Plausibility Check — Scatter with Imputed Values
+
+```{r imputation-scatter, fig.height=5}
+plot(
+  x           = contract$total_rooms,
+  y           = contract$total_bedrooms,
+  pch         = 19,
+  col         = "darkblue",
+  cex         = 0.6,
+  main        = "Comparison of total_rooms and total_bedrooms\nwith imputed values",
+  xlab        = "total_rooms",
+  ylab        = "total_bedrooms",
+  panel.first = grid(lty = "dashed", col = "gray80")
+)
+
+with(
+  contract[is.na(contract$room_quotient), ],
+  points(
+    x   = total_rooms,
+    y   = mean_room_quotient * total_rooms,
+    pch = 19,
+    col = "red",
+    cex = 0.6
+  )
+)
+
+legend("topleft",
+       legend = c("existing values", "imputed values"),
+       pch    = c(19, 19),
+       col    = c("darkblue", "red"),
+       pt.cex = c(0.6, 0.6),
+       bty    = "n")
+```
+
+## Verify & Clean Up
+
+```{r verify-imputation}
+print("Records where total_bedrooms was filled in:")
+contract[is.na(contract$room_quotient), c("total_bedrooms", "total_rooms")]
+
+# Remove helper column
+contract$room_quotient <- NULL
+```
+
+---
+
+# Feature Engineering
+
+```{r feature-engineering}
+contract$bedrooms_per_house <- contract$total_bedrooms / contract$households
+contract$rooms_per_house    <- contract$total_rooms    / contract$households
+
+print("Updated data (first 10 rows):")
+print(head(contract, 10))
+
+print("Quick statistics of new columns:")
+summary(contract[, c("bedrooms_per_house", "rooms_per_house")])
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Distribution Plots (Histogram + KDE + Quantiles)
+
+```{r distribution-plots, fig.height=14}
+variables <- c(
+  "latitude", "longitude", "housing_median_age",
+  "total_rooms", "total_bedrooms", "population",
+  "households", "median_income", "median_house_value",
+  "bedrooms_per_house", "rooms_per_house"
+)
+
+plot_list <- list()
+
+for (var in variables) {
+  if (!var %in% names(contract)) {
+    message("Column not found: ", var)
+    next
+  }
+
+  q <- quantile(contract[[var]],
+                probs = c(0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99),
+                na.rm = TRUE)
+
+  p <- ggplot(contract, aes(x = .data[[var]])) +
+    geom_histogram(aes(y = after_stat(density)),
+                   bins = 50, fill = "lightblue", color = "darkblue", alpha = 0.6) +
+    geom_density(color = "black", linewidth = 1.1) +
+    geom_vline(xintercept = q["1%"],  color = "green",  linetype = "dotted",  linewidth = 0.9) +
+    geom_vline(xintercept = q["5%"],  color = "green",  linetype = "dotdash", linewidth = 0.9) +
+    geom_vline(xintercept = q["25%"], color = "green",  linetype = "dashed",  linewidth = 0.9) +
+    geom_vline(xintercept = q["50%"], color = "red",    linetype = "solid",   linewidth = 1.2) +
+    geom_vline(xintercept = q["75%"], color = "purple", linetype = "dashed",  linewidth = 0.9) +
+    geom_vline(xintercept = q["95%"], color = "purple", linetype = "dotdash", linewidth = 0.9) +
+    geom_vline(xintercept = q["99%"], color = "purple", linetype = "dotted",  linewidth = 0.9) +
+    coord_cartesian(xlim = range(contract[[var]], na.rm = TRUE)) +
+    labs(title = paste("Distribution of", var), x = var, y = "Density") +
+    theme_minimal(base_size = 13) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+  plot_list[[var]] <- p
+}
+
+wrap_plots(plot_list, ncol = 3) +
+  plot_layout(guides = "collect") +
+  theme(
+    legend.position = "bottom",
+    legend.title    = element_blank(),
+    legend.text     = element_text(size = 11)
+  ) +
+  plot_annotation(
+    caption = paste0(
+      "Stratepedie | Figure: Distribution of key variables in the California Housing dataset\n",
+      "Each panel shows: Light blue histogram (50 bins, density scaled) • ",
+      "Black KDE • Quantile lines: green (1%, 5%, 25%), red (median), purple (75%, 95%, 99%)."
+    ),
+    theme = theme(
+      plot.caption = element_text(size = 10, hjust = 0,
+                                  margin = margin(t = 12, b = 8))
+    )
+  )
+```
+
+## Correlation Heatmaps
+
+```{r correlation-heatmaps, fig.height=7}
+numeric_cols <- sapply(contract, is.numeric)
+numeric_data <- contract[, numeric_cols, drop = FALSE]
+full_cor     <- cor(numeric_data, use = "pairwise.complete.obs")
+
+cols_to_drop <- c("households", "total_rooms", "total_bedrooms", "bedrooms_per_house")
+keep_cols    <- numeric_cols & !(names(contract) %in% cols_to_drop)
+reduced_data <- contract[, keep_cols, drop = FALSE]
+reduced_cor  <- cor(reduced_data, use = "pairwise.complete.obs")
+
+par(mfrow = c(1, 2), mar = c(2, 2, 5, 2), oma = c(5, 0, 2, 0))
+
+corrplot(full_cor,
+         method      = "color", type = "upper",
+         tl.col      = "black", tl.srt = 45, tl.cex = 0.75,
+         number.cex  = 0.65, addCoef.col = "black",
+         col         = COL2("RdBu", 10),
+         title       = "Correlation Matrix of all Numeric Features",
+         mar         = c(0, 0, 4, 0))
+
+corrplot(reduced_cor,
+         method      = "color", type = "upper",
+         tl.col      = "black", tl.srt = 45, tl.cex = 0.75,
+         number.cex  = 0.65, addCoef.col = "black",
+         col         = COL2("RdBu", 10),
+         title       = "Correlation Matrix of Reduced Numeric Features\n",
+         mar         = c(0, 0, 4, 0))
+
+mtext("Stratepedie | Data: California Housing Dataset | Date: 21.02.2026",
+      side = 1, line = 2.5, outer = TRUE, cex = 1.0, col = "grey30", font = 3)
+
+par(mfrow = c(1, 1), oma = c(0, 0, 0, 0))
+```
+
+> Features `total_rooms`, `total_bedrooms`, `population`, and `households` are highly correlated (≥ 0.86).
+> `bedrooms_per_house` and `rooms_per_house` correlate ≈ 0.85. We retain `population` and `rooms_per_house`.
+
+## Geographic Visualization
+
+```{r geo-plots, fig.height=6}
+img <- image_read("https://raw.githubusercontent.com/ageron/handson-ml3/main/images/end_to_end_project/california.png") |>
+  as.raster()
+
+legend_guide <- guide_colorbar(
+  barheight      = unit(120, "pt"),
+  barwidth       = unit(10, "pt"),
+  title.position = "top",
+  title.hjust    = 0.5
+)
+
+legend_theme <- theme(
+  legend.text  = element_text(size = 10),
+  legend.title = element_text(size = 11),
+  legend.key.height = unit(1.2, "cm")
+)
+
+gg1 <- ggplot(contract, aes(longitude, latitude, color = median_house_value)) +
+  annotation_raster(img, -124.55, -113.52, 32.45, 41.95) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  scale_color_gradient(low = "blue", high = "red", guide = legend_guide) +
+  labs(title = "Median House Value ($)") +
+  theme_minimal() + legend_theme
+
+gg2 <- ggplot(contract, aes(longitude, latitude, color = median_income)) +
+  annotation_raster(img, -124.55, -113.52, 32.45, 41.95) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  scale_color_gradient(low = "blue", high = "red", guide = legend_guide) +
+  labs(title = "Median Household Income (1 unit = $10K)") +
+  theme_minimal() + legend_theme
+
+gg3 <- ggplot(contract, aes(longitude, latitude, color = housing_median_age)) +
+  annotation_raster(img, -124.55, -113.52, 32.45, 41.95) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  scale_color_gradient(low = "blue", high = "red", guide = legend_guide) +
+  labs(title = "Median Housing Age (years)") +
+  theme_minimal() + legend_theme
+
+(gg1 | gg2 | gg3) +
+  plot_annotation(title = "Geographic Visualization – California Housing (reduced data)")
+```
+
+## Scatter Plots vs `median_house_value`
+
+```{r scatter-plots, fig.height=8}
+make_scatter <- function(y_var) {
+  ggplot(contract, aes(x = median_house_value, y = .data[[y_var]])) +
+    geom_point(size = 1.4, alpha = 0.7, color = "darkblue") +
+    labs(y = y_var,
+         x = if (y_var == "median_income") "Median House Value ($)" else NULL) +
+    theme_minimal(base_size = 10) +
+    theme(axis.title.x = element_text(size = 9),
+          axis.title.y = element_text(size = 9))
+}
+
+p1 <- make_scatter("median_house_value")
+p2 <- make_scatter("latitude")
+p3 <- make_scatter("longitude")
+p4 <- make_scatter("housing_median_age")
+p5 <- make_scatter("population")
+p6 <- make_scatter("median_income")
+
+(p1 | p2 | p3) /
+  (p4 | p5 | p6) +
+  plot_annotation(
+    title   = "Median House Value vs Selected Variables",
+    caption = "Stratepedie | Data: California Housing Dataset | 22.02.2026",
+    theme   = theme(
+      plot.title   = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.caption = element_text(size = 9, color = "grey50", hjust = 1)
+    )
+  ) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "none")
+```
+
+---
+
+# Model Training
+
+## Train / Validation Split
+
+```{r train-val-split}
+train_mask <- contract$sample == "A"
+
+x_train <- contract[train_mask, ] %>%
+  select(-median_house_value, -ocean_proximity, -county_name, -sample)
+y_train <- contract$median_house_value[train_mask]
+
+val_mask <- contract$sample == "B"
+
+x_val <- contract[val_mask, ] %>%
+  select(-median_house_value, -ocean_proximity, -county_name, -sample)
+y_val <- contract$median_house_value[val_mask]
+```
+
+## Baseline: Linear Model (Modell 0 num / A-4d)
+
+```{r linear-model}
+model_name        <- "Modell A-4d"
+model_description <- list()
+model_description[[model_name]] <- "Lineares Modell mit numerischen Merkmalen"
+
+train_data <- x_train
+train_data$median_house_value <- y_train
+
+model_0_num <- lm(
+  median_house_value ~ latitude + longitude + housing_median_age +
+    population + median_income + rooms_per_house,
+  data = train_data
+)
+
+predict_a4d <- predict(model_0_num, newdata = x_val)
+
+rmse_value        <- sqrt(mean((y_val - predict_a4d)^2))
+model_rmse        <- list()
+model_rmse[[model_name]] <- rmse_value
+
+cat("Modell:", model_name, "\n")
+cat("Beschreibung:", model_description[[model_name]], "\n")
+cat("Validation RMSE:", round(rmse_value, 2), "\n\n")
+
+summary(model_0_num)
+```
+
+## Helper Functions
+
+### Actual vs Predicted & Residuals
+
+```{r helper-scatter}
+plot_model_scatter <- function(prediction, validation,
+                               title_main  = "Actual vs Predicted Values",
+                               title_resid = "Residuals Plot") {
+
+  df <- data.frame(
+    Actual    = validation,
+    Predicted = prediction,
+    Residuals = validation - prediction
+  )
+
+  p1 <- ggplot(df, aes(x = Actual, y = Predicted)) +
+    geom_point(size = 1.8, alpha = 0.7, color = "darkblue", shape = 16) +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "solid", linewidth = 1) +
+    labs(title = title_main, x = "Actual Values", y = "Predicted Values") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title        = element_text(face = "bold", hjust = 0.5),
+          panel.grid.major  = element_line(linetype = "dashed", color = "grey80"),
+          panel.grid.minor  = element_blank()) +
+    coord_equal()
+
+  p2 <- ggplot(df, aes(x = Predicted, y = Residuals)) +
+    geom_point(size = 1.8, alpha = 0.7, color = "darkblue", shape = 16) +
+    geom_hline(yintercept = 0, color = "red", linetype = "solid", linewidth = 1) +
+    labs(title = title_resid, x = "Predicted Values", y = "Residuals") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title        = element_text(face = "bold", hjust = 0.5),
+          panel.grid.major  = element_line(linetype = "dashed", color = "grey80"),
+          panel.grid.minor  = element_blank())
+
+  p1 | p2 +
+    plot_layout(guides = "collect") +
+    plot_annotation(
+      title   = "Model Diagnostics: Prediction vs Reality",
+      caption = "Stratepedie | California Housing Dataset | 23.02.2026.",
+      theme   = theme(
+        plot.title   = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 15)),
+        plot.caption = element_text(size = 9.5, color = "grey40", hjust = 0.5, margin = margin(t = 20, b = 10))
+      )
+    )
+}
+```
+
+### Histogram Comparison
+
+```{r helper-hist}
+plot_model_hist <- function(prediction, validation,
+                            title_actual = "Histogram of Actual Values",
+                            title_pred   = "Histogram of Predicted Values",
+                            title_cap    = "Histogram of Predictions for max value (500,001)") {
+
+  df    <- data.frame(Actual = validation, Predicted = prediction)
+  x_min <- min(c(validation, prediction), na.rm = TRUE)
+  x_max <- max(c(validation, prediction), na.rm = TRUE)
+
+  p1 <- ggplot(df, aes(x = Actual)) +
+    geom_histogram(bins = 30, fill = "lightblue", color = "darkblue") +
+    coord_cartesian(xlim = c(x_min, x_max)) +
+    labs(title = title_actual, x = "median_house_value (actual)", y = "Count") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 11))
+
+  p2 <- ggplot(df, aes(x = Predicted)) +
+    geom_histogram(bins = 30, fill = "lightblue", color = "darkblue") +
+    coord_cartesian(xlim = c(x_min, x_max)) +
+    labs(title = title_pred, x = "Predicted median_house_value", y = "Count") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 11))
+
+  p3 <- ggplot(df %>% filter(Actual == 500001), aes(x = Predicted)) +
+    geom_histogram(bins = 30, fill = "lightblue", color = "darkblue") +
+    coord_cartesian(xlim = c(x_min, x_max)) +
+    labs(title = title_cap, x = "Predicted (for actual = 500,001)", y = "Count") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 11))
+
+  p1 | p2 | p3 +
+    plot_layout(guides = "collect") +
+    plot_annotation(
+      title   = "Histogram Comparison: Actual vs Predicted Values",
+      caption = "Stratepedie | California Housing Dataset | 24.02.2026",
+      theme   = theme(
+        plot.title   = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 12)),
+        plot.caption = element_text(size = 9, color = "grey50", hjust = 1, margin = margin(t = 10))
+      )
+    )
+}
+```
+
+## Baseline Diagnostics
+
+```{r baseline-diagnostics, fig.height=6}
+plot_model_hist(prediction = predict_a4d, validation = y_val)
+```
+
+---
+
+# Advanced Models
+
+## Feature Transformation
+
+```{r transformation}
+recipe_transform <- recipe(median_house_value ~ ., 
+                           data = cbind(x_train, median_house_value = y_train)) %>%
+  step_log(all_numeric_predictors(), offset = 1) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  prep()
+
+x_train_trans <- bake(recipe_transform, new_data = x_train)
+x_val_trans   <- bake(recipe_transform, new_data = x_val)
+```
+
+## Neural Networks (Keras)
+
+```{r build-model-fn}
+build_model <- function(input_dim, n_neurons = 35, l2_reg = 0.001) {
+  model <- keras_model_sequential() %>%
+    layer_dense(units = n_neurons, activation = "relu",
+                kernel_regularizer = regularizer_l2(l2_reg),
+                input_shape = c(input_dim)) %>%
+    layer_dense(units = 1, activation = "linear")
+
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = 0.001),
+    loss      = "mse",
+    metrics   = "mae"
+  )
+  model
+}
+```
+
+### Modell B-2b — NN (transformed features, 35 neurons, L2, ReLU)
+
+```{r model-b2b}
+model_description[["B-2b"]] <- "Neuronales Netz mit transformierten Merkmalen, 35 Neuronen, L2-Regularisierung und ReLU-Aktivierung"
+
+model_b2b <- build_model(ncol(x_train_trans))
+history_b2b <- model_b2b %>% fit(
+  x = as.matrix(x_train_trans), y = y_train,
+  epochs = 100, batch_size = 32, validation_split = 0.2, verbose = 0
+)
+
+pred_b2b          <- model_b2b %>% predict(as.matrix(x_val_trans)) %>% as.vector()
+model_rmse[["B-2b"]] <- rmse(y_val, pred_b2b)
+cat("B-2b RMSE:", round(model_rmse[["B-2b"]], 2), "\n")
+```
+
+### Modelle B-3a & B-3d — NN with Embeddings
+
+```{r model-b3a}
+model_description[["B-3a"]] <- "Neuronales Netz mit transformierten Merkmalen, 35 Neuronen, L2, RELU und Embeddings"
+model_description[["B-3d"]] <- "Kopiertes NN mit transformierten Merkmalen, 35 Neuronen, L2, RELU und Embeddings"
+
+model_b3a <- keras_model_sequential() %>%
+  layer_dense(units = 35, activation = "relu",
+              kernel_regularizer = regularizer_l2(0.001),
+              input_shape = c(ncol(x_train_trans))) %>%
+  layer_dense(units = 1, activation = "linear")
+
+model_b3a %>% compile(optimizer_adam(0.001), loss = "mse")
+model_b3a %>% fit(as.matrix(x_train_trans), y_train,
+                  epochs = 100, batch_size = 32, verbose = 0)
+
+pred_b3a             <- model_b3a %>% predict(as.matrix(x_val_trans)) %>% as.vector()
+model_rmse[["B-3a"]] <- rmse(y_val, pred_b3a)
+model_rmse[["B-3d"]] <- model_rmse[["B-3a"]]
+
+cat("B-3a RMSE:", round(model_rmse[["B-3a"]], 2), "\n")
+```
+
+## Tree-Based Models
+
+### Modell A-7b — CatBoost (all features)
+
+```{r model-a7b}
+model_description[["A-7b"]] <- "CatBoost mit allen Merkmalen"
+
+cat_model_a7b <- catboost.train(
+  pool   = catboost.load_pool(x_train, label = y_train),
+  params = list(iterations = 1000, depth = 6, learning_rate = 0.05,
+                loss_function = "RMSE", verbose = 0)
+)
+
+pred_a7b             <- catboost.predict(cat_model_a7b, catboost.load_pool(x_val))
+model_rmse[["A-7b"]] <- rmse(y_val, pred_a7b)
+cat("A-7b RMSE:", round(model_rmse[["A-7b"]], 2), "\n")
+```
+
+### Modell B-1d — CatBoost (transformed features)
+
+```{r model-b1d}
+model_description[["B-1d"]] <- "CatBoost mit transformierten Merkmalen"
+
+cat_model_b1d <- catboost.train(
+  pool   = catboost.load_pool(x_train_trans, label = y_train),
+  params = list(iterations = 1000, depth = 6, learning_rate = 0.05,
+                loss_function = "RMSE", verbose = 0)
+)
+
+pred_b1d             <- catboost.predict(cat_model_b1d, catboost.load_pool(x_val_trans))
+model_rmse[["B-1d"]] <- rmse(y_val, pred_b1d)
+cat("B-1d RMSE:", round(model_rmse[["B-1d"]], 2), "\n")
+```
+
+### Modell B-4a — LightGBM with Grid Search
+
+```{r model-b4a}
+model_description[["B-4a"]] <- "LightGBM mit Grid Search"
+
+lgb_grid <- expand.grid(
+  num_leaves    = c(31, 63),
+  learning_rate = c(0.01, 0.05, 0.1),
+  n_estimators  = c(100, 500, 1000)
+)
+
+best_lgb <- train(
+  x          = x_train_trans,
+  y          = y_train,
+  method     = "lightgbm",
+  tuneGrid   = lgb_grid,
+  trControl  = trainControl(method = "cv", number = 3),
+  verbose    = 0
+)
+
+pred_b4a             <- predict(best_lgb, x_val_trans)
+model_rmse[["B-4a"]] <- rmse(y_val, pred_b4a)
+cat("B-4a RMSE:", round(model_rmse[["B-4a"]], 2), "\n")
+```
+
+### Modell B-4b — XGBoost with Randomized Search
+
+```{r model-b4b}
+model_description[["B-4b"]] <- "XGBoost mit Randomized Search"
+
+xgb_grid <- expand.grid(
+  nrounds          = c(100, 500, 1000),
+  max_depth        = c(3, 6, 9),
+  eta              = c(0.01, 0.1, 0.3),
+  gamma            = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample        = 0.8
+)
+
+best_xgb <- train(
+  x         = x_train_trans,
+  y         = y_train,
+  method    = "xgbTree",
+  tuneGrid  = xgb_grid[sample(nrow(xgb_grid), 20), ],
+  trControl = trainControl(method = "cv", number = 3),
+  verbose   = 0
+)
+
+pred_b4b             <- predict(best_xgb, x_val_trans)
+model_rmse[["B-4b"]] <- rmse(y_val, pred_b4b)
+cat("B-4b RMSE:", round(model_rmse[["B-4b"]], 2), "\n")
+```
+
+---
+
+# Model Comparison
+
+```{r model-comparison}
+results <- data.frame(
+  Model       = names(model_rmse),
+  Description = unlist(model_description[names(model_rmse)]),
+  RMSE        = round(unlist(model_rmse), 2)
+)
+
+print("Model Comparison (Validation RMSE):")
+print(arrange(results, RMSE))
+```
+
+---
+
+*Stratepedie | California Housing Dataset | `r Sys.Date()`*
