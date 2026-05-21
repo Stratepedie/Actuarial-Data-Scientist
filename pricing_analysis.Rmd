@@ -1,9 +1,11 @@
 ---
-title: "Product Management: Pricing"
-subtitle: "Pricing Techniques in Insurance — When Damage/Loss Histories Are Unavailable"
+title: 'Product Management: Pricing'
 author: "Stratepedie"
 date: "`r Sys.Date()`"
 output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
   html_document:
     toc: true
     toc_depth: 3
@@ -12,6 +14,7 @@ output:
     highlight: tango
     number_sections: true
     code_folding: show
+subtitle: Pricing Techniques in Insurance — When Damage/Loss Histories Are Unavailable
 ---
 
 ```{r setup, include=FALSE}
@@ -53,6 +56,7 @@ library(lightgbm)
 library(xgboost)
 library(caret)
 library(Metrics)
+library(tensorflow)
 ```
 
 ---
