@@ -1,0 +1,204 @@
+/* =====================================================================
+   ERWEITERUNG: Exposure (Jahreseinheiten) je Gefahr
+   Basis : "Test NN Group V5 - Test cutoff V11 ... Wohngebaeude+Sch+stat.sql"
+   Autor : Claude / Aktuariat
+   Stand : 22.05.2026
+   ---------------------------------------------------------------------
+   Zweck
+   -----
+   Das bestehende Skript liefert je Vertrag GENAU EINE Exposure-Groesse:
+   "Haltedauer in Jahren" = (Vertragsende - Vertragsbeginn) / 365,25.
+
+   Der Vertrag deckt aber mehrere Gefahren, die zu UNTERSCHIEDLICHEN
+   Zeitpunkten ein- und ausgeschlossen werden (gf.einschluss_gf /
+   gf.ausschluss_gf). Die Vertrags-Haltedauer ueberschaetzt deshalb die
+   tatsaechliche Risikozeit jeder einzelnen Gefahr, sobald eine Gefahr
+   spaeter eingeschlossen oder frueher ausgeschlossen wurde.
+
+   Diese Datei ERSETZT NUR den Schlussteil des Skripts
+       SELECT * FROM efh_lw_voll;
+   durch einen aeusseren SELECT, der je Gefahr eine Spalte
+       "JE <Gefahr>"  (Jahreseinheiten = Exposure-Jahre)
+   ergaenzt. Die 700 Zeilen davor bleiben UNVERAENDERT.
+
+   Methodik (vgl. Bericht, Kap. 4 zu Kapitel 7 des Buches
+   "A Course in Credibility Theory"):
+       JE_Gefahr = max( 0 ,
+                        ( min(Vertragsende , Ausschluss_Gefahr)
+                        - max(Vertragsbeginn, Einschluss_Gefahr) ) / 365,25 )
+
+   - Vertragsende  = storno_dat_v        bei Storno
+                   = cutoff_date + 1     bei aktivem Vertrag   (identisch
+                                         zur bestehenden Haltedauer-Logik)
+   - Einschluss_/Ausschluss_Gefahr sind die bereits im Skript berechneten
+     Spalten "Einschluss <Gefahr>" / "Ausschluss <Gefahr>".
+   - GREATEST(0, ...) verhindert negative Exposure, falls eine Gefahr nach
+     Vertragsende eingeschlossen wurde.
+   - Ist eine Gefahr nicht versichert, sind Einschluss/Ausschluss NULL ->
+     JE wird NULL (NULL = "Gefahr nicht im Bestand", bewusst nicht 0).
+
+   Hinweis Stichtagslogik
+   ----------------------
+   Die WHERE-Bedingung des Innenteils filtert
+       gf.ausschluss_gf > cutoff  AND  gf.einschluss_gf <= cutoff
+   d.h. es ueberleben nur am Stichtag AKTIVE Gefahren. "JE <Gefahr>" ist
+   damit die bis zum Stichtag verdiente Exposure der aktuell aktiven
+   Gefahren. Soll auch unterjaehrig ausgeschlossene Gefahren-Historie
+   einfliessen, muss der gf-Datumsfilter aus dem WHERE in die jeweiligen
+   CASE-Bedingungen verschoben werden (siehe Bericht, Abschnitt 5.3).
+   ===================================================================== */
+
+
+/* ---------------------------------------------------------------------
+   1) Zusatz-CTE: Vertragsende einmalig berechnen
+      (Oracle erlaubt keine Wiederverwendung von Spalten-Aliassen im
+       selben SELECT, daher eine eigene CTE-Ebene.)
+   --------------------------------------------------------------------- */
+, efh_lw_je AS (
+    SELECT
+        e.*,
+        CASE
+            WHEN e.s_status_v = 'Storno' THEN e.storno_dat_v
+            ELSE (SELECT cutoff_date FROM cutoff) + 1
+        END AS vertrag_ende_dat
+    FROM efh_lw_voll e
+)
+
+/* ---------------------------------------------------------------------
+   2) Finaler SELECT: alle bisherigen Spalten + Jahreseinheiten je Gefahr
+      -> ersetzt das bisherige  "SELECT * FROM efh_lw_voll;"
+   --------------------------------------------------------------------- */
+SELECT
+    j.*,
+
+    /* ============ Jahreseinheiten (Exposure-Jahre) je Gefahr ============ */
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Wohngebäude")
+        - GREATEST(j.beginn_v, j."Einschluss Wohngebäude")) / 365.25), 2)
+        AS "JE Wohngebäude",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Feuer")
+        - GREATEST(j.beginn_v, j."Einschluss Feuer")) / 365.25), 2)
+        AS "JE Feuer",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Leitungswasser")
+        - GREATEST(j.beginn_v, j."Einschluss Leitungswasser")) / 365.25), 2)
+        AS "JE Leitungswasser",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Sturm/Hagel")
+        - GREATEST(j.beginn_v, j."Einschluss Sturm/Hagel")) / 365.25), 2)
+        AS "JE Sturm/Hagel",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Glas")
+        - GREATEST(j.beginn_v, j."Einschluss Glas")) / 365.25), 2)
+        AS "JE Glas",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Elementar")
+        - GREATEST(j.beginn_v, j."Einschluss Elementar")) / 365.25), 2)
+        AS "JE Elementar",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss HUG")
+        - GREATEST(j.beginn_v, j."Einschluss HUG")) / 365.25), 2)
+        AS "JE HUG",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Gewässerschadenhaftpflicht")
+        - GREATEST(j.beginn_v, j."Einschluss Gewässerschadenhaftpflicht")) / 365.25), 2)
+        AS "JE Gewässerschadenhaftpflicht",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Allgefahren Wohngebäude")
+        - GREATEST(j.beginn_v, j."Einschluss Allgefahren Wohngebäude")) / 365.25), 2)
+        AS "JE Allgefahren Wohngebäude",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Allgefahren erneuerbare Energien")
+        - GREATEST(j.beginn_v, j."Einschluss Allgefahren erneuerbare Energien")) / 365.25), 2)
+        AS "JE Allgefahren erneuerbare Energien",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Allgefahren Haustechnik")
+        - GREATEST(j.beginn_v, j."Einschluss Allgefahren Haustechnik")) / 365.25), 2)
+        AS "JE Allgefahren Haustechnik",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Nachhaltigkeit")
+        - GREATEST(j.beginn_v, j."Einschluss Nachhaltigkeit")) / 365.25), 2)
+        AS "JE Nachhaltigkeit",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Erdbebenzone 3")
+        - GREATEST(j.beginn_v, j."Einschluss Erdbebenzone 3")) / 365.25), 2)
+        AS "JE Erdbebenzone 3",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Teilüberschwemmung")
+        - GREATEST(j.beginn_v, j."Einschluss Teilüberschwemmung")) / 365.25), 2)
+        AS "JE Teilüberschwemmung",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Feuerrohbau")
+        - GREATEST(j.beginn_v, j."Einschluss Feuerrohbau")) / 365.25), 2)
+        AS "JE Feuerrohbau",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Konditionsdifferenzdeckung")
+        - GREATEST(j.beginn_v, j."Einschluss Konditionsdifferenzdeckung")) / 365.25), 2)
+        AS "JE Konditionsdifferenzdeckung",
+
+    ROUND(GREATEST(0, (LEAST(j.vertrag_ende_dat, j."Ausschluss Marktgarantie")
+        - GREATEST(j.beginn_v, j."Einschluss Marktgarantie")) / 365.25), 2)
+        AS "JE Marktgarantie"
+
+FROM efh_lw_je j;
+
+
+/* =====================================================================
+   OPTIONAL - Erweiterung DURCHSCHNITTSSCHADEN / ANZAHL_SCHAEDEN je Gefahr
+   ---------------------------------------------------------------------
+   Heute aggregiert die Sub-Query s_agg NUR ueber sch.id_v, d.h. ueber
+   ALLE Schaeden eines Vertrags (alle Gefahren gemischt):
+
+       LEFT JOIN (
+           SELECT sch.id_v,
+                  AVG(sch.w3_gesamtschbetr_sch) AS durchschnittsschaden,
+                  COUNT(sch.nummer_eigen_sch)   AS anzahl_schaeden
+           FROM   schaden sch
+           GROUP  BY sch.id_v
+       ) s_agg ON s_agg.id_v = v.id_v
+
+   Fuer Frequenz/Severity JE GEFAHR muss die Aggregation einen Gefahren-
+   Schluessel enthalten. Voraussetzung: die Tabelle SCHADEN besitzt einen
+   Bezug zur Gefahr. Bitte zuerst pruefen:   DESCRIBE schaden;
+   In Oasis-naehen Modellen heisst dieser Schluessel typischerweise
+   sch.id_gf, sch.id_sp oder ein Schadenursachen-/Spartenfeld.
+
+   --- Variante A: SCHADEN besitzt FK auf GEFAHR (z.B. sch.id_gf) ---------
+   Ersetze die s_agg-Sub-Query durch eine Aggregation je (Vertrag, Gefahr):
+
+       LEFT JOIN (
+           SELECT sch.id_v,
+                  gf2.gefahr_gf,
+                  AVG(sch.w3_gesamtschbetr_sch) AS durchschnittsschaden,
+                  COUNT(sch.nummer_eigen_sch)   AS anzahl_schaeden
+           FROM   schaden sch
+           JOIN   gefahr  gf2 ON gf2.id_gf = sch.id_gf
+           GROUP  BY sch.id_v, gf2.gefahr_gf
+       ) s_gf ON s_gf.id_v = v.id_v
+
+   und pivotiere im Haupt-SELECT je Gefahr - identisches CASE-Muster wie
+   bei "Praemie <Gefahr>":
+
+       SUM(CASE WHEN s_gf.gefahr_gf LIKE '%Leitungswasser%'
+                THEN s_gf.anzahl_schaeden ELSE 0 END)
+           AS "Anzahl Schäden Leitungswasser",
+       AVG(CASE WHEN s_gf.gefahr_gf LIKE '%Leitungswasser%'
+                THEN s_gf.durchschnittsschaden END)
+           AS "Durchschnittsschaden Leitungswasser",
+       ... (je Gefahr analog) ...
+
+   WICHTIG: s_gf bringt mehrere Zeilen je Vertrag (eine je Gefahr). Da der
+   Haupt-SELECT ohnehin ueber GROUP BY je Vertrag verdichtet, ist das
+   unkritisch - die CASE/SUM/AVG-Pivots laufen im selben GROUP BY.
+
+   --- Variante B: SCHADEN hat nur ein Ursachen-/Spartenfeld --------------
+   Falls kein FK auf GEFAHR existiert, sondern z.B. sch.ursache_sch oder
+   sch.sparte_sch: dieselbe Pivot-Logik, aber mit der fachlichen
+   Zuordnung Ursache -> Gefahr, z.B.
+
+       SUM(CASE WHEN sch.ursache_sch IN ('Leitungswasser','Frost/Bruch')
+                THEN 1 ELSE 0 END) AS "Anzahl Schäden Leitungswasser"
+
+   Die Zuordnungstabelle Ursache->Gefahr ist mit dem Schaden-/Tarif-
+   Aktuariat abzustimmen (siehe Bericht, Abschnitt 6).
+   ===================================================================== */
