@@ -1,0 +1,914 @@
+---
+title: "Bestandsanalyse Privatgebäude (EFH)"
+subtitle: "Portfolio-EDA und Tiefenanalysen – Wohngebäude · Leitungswasser · Großschaden"
+author: "Aktuariat"
+date: "`r format(Sys.Date(), '%d.%m.%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+# =============================================================================
+# Globale Knit-Einstellungen
+# =============================================================================
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 9, fig.height = 5, dpi = 110, fig.align = "center"
+)
+options(scipen = 999)
+```
+
+# Einleitung und Vorgehen
+
+Dieser Bericht analysiert den EFH-Gebäudebestand auf Basis des erweiterten
+SQL-Auszugs. Der Auszug liefert je Vertrag eine Zeile und enthält nun – über
+die ursprüngliche Vertragssicht hinaus – **gefahrenscharfe Kennzahlen**:
+Jahreseinheiten (`JE`), Schadenanzahl (`Claims`), Schadenaufwand (`Aufwand`),
+Mittelschaden (`Sev`), erwarteten Schaden (`EL`) und Schadenquote (`SQ`) je
+Gefahr sowie Portfolio-Aggregate (`SQ Gesamt`, `Pricing Bewertung`) und
+Großschaden-Merkmale.
+
+**Aufbau des Berichts** (bewusst von grob nach fein):
+
+1. **Portfolio-EDA** – Überblick über den gesamten Bestand: Struktur,
+   Exposure, Prämie, Schadenquote, Pricing-Bewertung, Großschäden.
+2. **Wohngebäude** – Tiefenanalyse der Kerngefahr.
+3. **Leitungswasser** – Tiefenanalyse inkl. korrekter, gefahrenscharfer
+   Exposure (`JE Leitungswasser`).
+4. **Großschaden** – separate Betrachtung der Großschäden.
+5. **Frequenz- und Severity-Modelle** – kompakte Modellstrecke.
+
+```{r pakete}
+# =============================================================================
+# Pakete
+# =============================================================================
+need <- c("dplyr","tidyr","purrr","ggplot2","readr","stringr","forcats",
+          "scales","lubridate","knitr","tibble")
+for (p in need) if (!requireNamespace(p, quietly = TRUE))
+  install.packages(p, repos = "https://cloud.r-project.org")
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(purrr); library(ggplot2)
+  library(readr); library(stringr); library(forcats); library(scales)
+  library(lubridate); library(knitr); library(tibble)
+})
+# optionale Pakete (nur fuer Modellteil / Excel-Import)
+hat_readxl <- requireNamespace("readxl", quietly = TRUE)
+hat_MASS   <- requireNamespace("MASS",   quietly = TRUE)
+hat_mgcv   <- requireNamespace("mgcv",   quietly = TRUE)
+```
+
+```{r theme}
+# =============================================================================
+# Einheitliches Diagramm-Layout (Corporate-Look)
+# =============================================================================
+farbe_haupt <- "#2E75B6"; farbe_akzent <- "#C00000"; farbe_grau <- "#7F7F7F"
+farben_disc <- c("#2E75B6","#C00000","#548235","#BF8F00","#7030A0",
+                 "#00B0B0","#ED7D31","#A6A6A6","#264478","#9E480E")
+
+theme_dom <- function(base = 12) {
+  theme_minimal(base_size = base, base_family = "sans") +
+    theme(
+      plot.title    = element_text(face = "bold", size = base + 3),
+      plot.subtitle = element_text(color = farbe_grau, size = base - 1),
+      axis.title    = element_text(color = farbe_grau),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      legend.position = "bottom",
+      strip.text = element_text(face = "bold")
+    )
+}
+theme_set(theme_dom())
+
+# deutsche Achsenformate
+eur  <- label_number(big.mark = ".", decimal.mark = ",", suffix = " \u20AC",
+                     accuracy = 1)
+pct  <- label_percent(big.mark = ".", decimal.mark = ",", accuracy = 0.1)
+zahl <- label_number(big.mark = ".", decimal.mark = ",", accuracy = 1)
+```
+
+```{r helfer}
+# =============================================================================
+# Hilfsfunktionen
+# =============================================================================
+
+# robustes Parsen deutscher Zahlen ("1.234,56" -> 1234.56)
+num_clean <- function(x) {
+  if (is.numeric(x)) return(x)
+  x <- as.character(x)
+  x <- str_replace_all(x, "[^0-9,.\\-]", "")
+  x <- str_replace_all(x, "\\.", "")     # Tausenderpunkt entfernen
+  x <- str_replace_all(x, ",", ".")      # Dezimalkomma -> Punkt
+  suppressWarnings(as.numeric(x))
+}
+char_clean <- function(x) {
+  x <- str_squish(as.character(x))
+  x[x %in% c("", "NA", "null", "NULL", "-", "- ohne -")] <- NA
+  x
+}
+# division ohne Division-durch-0-Fehler
+safe_rate <- function(zaehler, nenner) {
+  ifelse(is.na(nenner) | nenner <= 0, NA_real_, zaehler / nenner)
+}
+# seltene Auspraegungen zu "Sonstige" zusammenfassen
+top_n_other <- function(x, n = 10, label = "Sonstige") {
+  x <- as.character(x); x[is.na(x)] <- label
+  top <- names(sort(table(x), decreasing = TRUE))[seq_len(min(n, length(unique(x))))]
+  factor(ifelse(x %in% top, x, label))
+}
+# Ausreisser kappen (Quantil-Winsorisierung) - nur fuer Darstellung
+winsor <- function(x, p = 0.99) {
+  hi <- quantile(x, p, na.rm = TRUE)
+  pmin(x, hi)
+}
+# Spaltennamen kanonisieren: Umlaute aufloesen, Sonderzeichen -> "_"
+cz <- function(x) {
+  x <- trimws(x)
+  x <- gsub("\u00e4","ae",x); x <- gsub("\u00f6","oe",x); x <- gsub("\u00fc","ue",x)
+  x <- gsub("\u00c4","Ae",x); x <- gsub("\u00d6","Oe",x); x <- gsub("\u00dc","Ue",x)
+  x <- gsub("\u00df","ss",x)
+  x <- gsub("[^A-Za-z0-9]+","_",x)
+  gsub("^_|_$","",x)
+}
+# existiert eine Spalte? / sicher auslesen
+hat  <- function(df, sp) cz(sp) %in% names(df)
+holn <- function(df, sp) if (hat(df, sp)) num_clean(df[[cz(sp)]]) else NA_real_
+holc <- function(df, sp) if (hat(df, sp)) char_clean(df[[cz(sp)]]) else NA_character_
+```
+
+```{r demodaten}
+# =============================================================================
+# Demo-Datengenerator
+# -----------------------------------------------------------------------------
+# Wird NUR verwendet, wenn unter 'pfad_daten' keine echte Datei liegt, damit
+# dieser Bericht sofort knitbar ist. Mit echten Daten einfach den Pfad setzen.
+# =============================================================================
+simuliere_demodaten <- function(n = 4000, seed = 42) {
+  set.seed(seed)
+  gefahren <- c("Wohngebäude","Feuer","Leitungswasser","Sturm/Hagel","Glas",
+                "Elementar","HUG")
+  beginn   <- as.Date("2026-05-02") - round(runif(n, 30, 365.25*14))
+  storno   <- runif(n) < 0.12
+  ende     <- as.Date(ifelse(storno,
+                as.numeric(beginn) + round(runif(n, 100, 365.25*8)),
+                as.numeric(as.Date("2026-05-02"))), origin = "1970-01-01")
+  halte    <- as.numeric(ende - beginn) / 365.25
+  zuers    <- sample(paste0("ZÜRS ", 1:4), n, TRUE, prob = c(.55,.25,.15,.05))
+  bl       <- sample(c("Bayern","NRW","Niedersachsen","Hessen","Sachsen",
+                       "Baden-Württemberg","Schleswig-Holstein"), n, TRUE)
+  baujahr  <- round(rnorm(n, 1985, 25)); baujahr <- pmin(pmax(baujahr,1900),2025)
+  wohnfl   <- round(pmax(40, rnorm(n, 145, 55)))
+  praemie_g <- round(pmax(120, rnorm(n, 760, 260)), 2)
+
+  df <- tibble(
+    VSNR_V = sprintf("IDCPT-04-%07d", seq_len(n)),
+    NUMMER_MANDANT = sample(c(1,2,13), n, TRUE),
+    S_STATUS_V = ifelse(storno, "Storno", "aktiv"),
+    BEGINN_V = beginn, STORNO_DAT_V = as.Date(ifelse(storno, ende, NA),
+              origin = "1970-01-01"),
+    VERTRAG_ENDE_DAT = ende,
+    `Haltedauer in Jahren` = round(halte, 2),
+    `Alter VN` = round(pmax(19, rnorm(n, 52, 14))),
+    Bundesland = bl, ZUERSZONE_WGB = zuers,
+    BAUJAHR_WGB = baujahr, WOHNFLAECHEQM_WGB = wohnfl,
+    BAUARTKLASSE_WGB = sample(c("BAK 1","BAK 2","BAK 3"), n, TRUE,
+                              prob = c(.7,.22,.08)),
+    BAUARTGEBAEUDE_WGB = sample(c("massiv","Fachwerk","Holz","gemischt"),
+                              n, TRUE, prob = c(.78,.08,.06,.08)),
+    MATERIALDACH_WGB = sample(c("hart","weich"), n, TRUE, prob = c(.93,.07)),
+    NUTZUNGSART_WGB = sample(c("eigengenutzt","vermietet","gemischt"),
+                              n, TRUE, prob = c(.75,.18,.07)),
+    `Tarifausprägung` = sample(c("Basis","Komfort","Standard","Top"), n, TRUE,
+                              prob = c(.18,.30,.30,.22)),
+    NACHHALTIGKEIT = sample(c("Ja","Nein"), n, TRUE, prob = c(.22,.78)),
+    `EFH/NG` = "EFH",
+    `Prämie Gesamt` = praemie_g
+  )
+
+  # je Gefahr: JE, Schaden, Aufwand, Praemie ---------------------------------
+  basis_freq <- c(Wohngebäude=.04, Feuer=.012, Leitungswasser=.085,
+                  `Sturm/Hagel`=.055, Glas=.05, Elementar=.03, HUG=.02)
+  basis_sev  <- c(Wohngebäude=3500, Feuer=14000, Leitungswasser=2600,
+                  `Sturm/Hagel`=1900, Glas=600, Elementar=4200, HUG=2500)
+  for (g in gefahren) {
+    # spaeterer Einschluss -> JE <= Haltedauer
+    je <- round(halte * ifelse(runif(n) < 0.25, runif(n, .3, .95), 1), 2)
+    cnt <- rpois(n, basis_freq[[g]] * je)
+    sev <- round(rlnorm(n, log(basis_sev[[g]]), 0.8))
+    auf <- cnt * sev
+    pr  <- round(praemie_g * runif(n, .03, .22), 2)
+    df[[paste0("JE ", g)]]      <- je
+    df[[paste0("Claims ", g)]]  <- cnt
+    df[[paste0("Aufwand ", g)]] <- auf
+    df[[paste0("Sev ", g)]]     <- ifelse(cnt > 0, round(auf / cnt), 0)
+    df[[paste0("Prämie ", g)]]  <- pr
+    df[[paste0("SQ ", g)]]      <- round(100 * safe_rate(auf, pr), 1)
+  }
+  # Aggregate -----------------------------------------------------------------
+  auf_cols <- paste0("Aufwand ", gefahren)
+  df$`Aufwand Gesamt Gefahren` <- rowSums(df[auf_cols])
+  df$`EL Gesamt`     <- round(df$`Prämie Gesamt` *
+                              runif(n, .7, 1.6) * 0.85, 2)
+  df$`SQ Gesamt`     <- round(100 * safe_rate(df$`Aufwand Gesamt Gefahren`,
+                                              df$`Prämie Gesamt`), 1)
+  kern <- paste0("Aufwand ", c("Feuer","Leitungswasser","Sturm/Hagel","Elementar"))
+  df$`SQ Gesamt KERN` <- round(100 * safe_rate(rowSums(df[kern]),
+                                               df$`Prämie Gesamt`), 1)
+  df$`Pricing Fehler`   <- round(df$`EL Gesamt` - df$`Prämie Gesamt`, 2)
+  df$`relativer Fehler` <- round(safe_rate(df$`Pricing Fehler`,
+                                           df$`Prämie Gesamt`), 4)
+  df$`Pricing Bewertung` <- cut(df$`relativer Fehler`,
+    breaks = c(-Inf,-0.10,0.10,Inf),
+    labels = c("Übertarifiert","Auskömmlich","Untertarifiert"))
+  df$`Frequenz WG` <- round(safe_rate(df$`Claims Wohngebäude`,
+                                      df$`JE Wohngebäude`), 4)
+  # Großschaden ---------------------------------------------------------------
+  schwelle <- 50000
+  df$`Aufwand Großschaden` <- ifelse(runif(n) < 0.025,
+                                     round(rlnorm(n, log(120000), .7)), 0)
+  df$`Hat Großschaden`     <- as.integer(df$`Aufwand Großschaden` > 0)
+  df$GROSSSCHADEN          <- df$`Hat Großschaden`
+  df$GROSSSCHADEN_AUFWAND  <- df$`Aufwand Großschaden`
+  df$`Aufwand Gesamt Gefahren` <- df$`Aufwand Gesamt Gefahren` +
+                                  df$`Aufwand Großschaden`
+  df$`Anteil Großschaden`  <- round(safe_rate(df$`Aufwand Großschaden`,
+                                     df$`Aufwand Gesamt Gefahren`), 3)
+  df$`Claims ohne Großschaden` <- rowSums(df[paste0("Claims ", gefahren)])
+  df$CLAIMS_FREQ_ONLY      <- as.integer(df$`Claims ohne Großschaden` > 0)
+  df
+}
+```
+
+```{r daten-laden}
+# =============================================================================
+# Daten laden
+# -----------------------------------------------------------------------------
+# >>> HIER den Pfad zum echten SQL-Export eintragen (CSV ';' oder XLSX) <<<
+pfad_daten <- "Bestand_EFH_Export.csv"
+
+if (file.exists(pfad_daten)) {
+  ext <- tolower(tools::file_ext(pfad_daten))
+  roh <- if (ext %in% c("xlsx","xls") && hat_readxl) {
+    readxl::read_excel(pfad_daten)
+  } else {
+    readr::read_delim(pfad_daten, delim = ";", locale = locale(encoding = "Latin1"),
+                      show_col_types = FALSE, name_repair = "minimal")
+  }
+  demo_modus <- FALSE
+} else {
+  roh <- simuliere_demodaten()
+  demo_modus <- TRUE
+}
+
+# Spaltennamen kanonisieren (Umlaute / Sonderzeichen)
+names(roh) <- cz(names(roh))
+roh <- as_tibble(roh)
+# stabile Zeilen-ID fuer alle spaeteren Joins (eine Zeile = ein Vertrag)
+roh$.rid <- seq_len(nrow(roh))
+```
+
+```{r demo-hinweis, results='asis', echo=FALSE}
+if (demo_modus) {
+  cat('<div style="background:#FFF3CD;border-left:6px solid #BF8F00;',
+      'padding:10px 14px;border-radius:4px;">',
+      '<b>Hinweis – Demo-Modus.</b> Unter <code>', pfad_daten, '</code> ',
+      'wurde keine Datei gefunden. Der Bericht läuft mit ',
+      '<b>simulierten Beispieldaten</b>, damit alle Visualisierungen sofort ',
+      'sichtbar sind. Für die echte Auswertung bitte den Pfad oben setzen.',
+      '</div>', sep = "")
+}
+```
+
+```{r aufbereitung}
+# =============================================================================
+# Aufbereitung: Typkonvertierung, abgeleitete Merkmale, Klassenbildung
+# =============================================================================
+gefahren_alle <- c("Wohngebäude","Feuer","Leitungswasser","Sturm/Hagel","Glas",
+  "Elementar","HUG","Gewässerschadenhaftpflicht","Allgefahren Wohngebäude",
+  "Allgefahren erneuerbare Energien","Allgefahren Haustechnik","Nachhaltigkeit",
+  "Erdbebenzone 3","Teilüberschwemmung","Feuerrohbau",
+  "Konditionsdifferenzdeckung","Marktgarantie")
+# tatsaechlich im Export vorhandene Gefahren (anhand JE-Spalte)
+gefahren <- gefahren_alle[ vapply(gefahren_alle,
+              function(g) hat(roh, paste0("JE ", g)), logical(1)) ]
+kerngefahren <- intersect(c("Feuer","Leitungswasser","Sturm/Hagel","Elementar"),
+                          gefahren)
+
+dat <- roh %>%
+  mutate(
+    status      = char_clean(holc(roh, "S_STATUS_V")),
+    haltedauer  = holn(roh, "Haltedauer in Jahren"),
+    praemie_ges = holn(roh, "Prämie Gesamt"),
+    aufwand_ges = holn(roh, "Aufwand Gesamt Gefahren"),
+    el_ges      = holn(roh, "EL Gesamt"),
+    sq_ges      = holn(roh, "SQ Gesamt"),
+    sq_kern     = holn(roh, "SQ Gesamt KERN"),
+    pricing_bew = factor(holc(roh, "Pricing Bewertung")),
+    pricing_err = holn(roh, "Pricing Fehler"),
+    rel_err     = holn(roh, "relativer Fehler"),
+    freq_wg     = holn(roh, "Frequenz WG"),
+    gross_flag  = holn(roh, "Hat Großschaden"),
+    gross_auf   = holn(roh, "Aufwand Großschaden"),
+    gross_ant   = holn(roh, "Anteil Großschaden"),
+    baujahr     = holn(roh, "BAUJAHR_WGB"),
+    wohnflaeche = holn(roh, "WOHNFLAECHEQM_WGB"),
+    alter_vn    = holn(roh, "Alter VN"),
+    zuers       = holc(roh, "ZUERSZONE_WGB"),
+    bundesland  = holc(roh, "Bundesland"),
+    tarif       = holc(roh, "Tarifausprägung"),
+    bauklasse   = holc(roh, "BAUARTKLASSE_WGB"),
+    nutzung     = holc(roh, "NUTZUNGSART_WGB"),
+    nachhaltig  = holc(roh, "NACHHALTIGKEIT")
+  ) %>%
+  mutate(
+    # SQ aus dem Export kann in % oder als Quote vorliegen -> normieren
+    sq_ges  = ifelse(!is.na(sq_ges)  & sq_ges  > 5, sq_ges/100,  sq_ges),
+    sq_kern = ifelse(!is.na(sq_kern) & sq_kern > 5, sq_kern/100, sq_kern),
+    gebaeudealter = ifelse(!is.na(baujahr) & baujahr > 1700,
+                           as.integer(format(Sys.Date(), "%Y")) - baujahr, NA),
+    alter_band = cut(gebaeudealter, c(-1,10,25,40,60,Inf),
+                     labels = c("0-10 J","11-25 J","26-40 J","41-60 J","60+ J")),
+    wohnflaeche_band = cut(wohnflaeche, c(0,80,120,160,220,Inf),
+                     labels = c("bis 80","81-120","121-160","161-220","220+")),
+    gross_flag = ifelse(is.na(gross_flag), 0, gross_flag)
+  )
+
+# Long-Format ueber alle Gefahren (eine Zeile je Vertrag x Gefahr)
+gefahr_long <- map_dfr(gefahren, function(g) {
+  tibble(
+    .rid    = roh$.rid,
+    gefahr  = g,
+    je      = holn(roh, paste0("JE ", g)),
+    claims  = holn(roh, paste0("Claims ", g)),
+    aufwand = holn(roh, paste0("Aufwand ", g)),
+    sev     = holn(roh, paste0("Sev ", g)),
+    praemie = holn(roh, paste0("Prämie ", g)),
+    sq      = holn(roh, paste0("SQ ", g))
+  )
+}) %>%
+  mutate(sq = ifelse(!is.na(sq) & sq > 5, sq/100, sq))
+
+# kompakte Vertrags-Merkmalstabelle zum Anjoinen an gefahr_long
+merkmale <- dat %>%
+  select(.rid, status, haltedauer, zuers, bundesland, bauklasse,
+         alter_band, wohnflaeche_band, gross_flag)
+
+n_vertraege <- nrow(dat)
+```
+
+---
+
+# Portfolio-EDA – Überblick über den Gesamtbestand
+
+## Kennzahlen auf einen Blick
+
+```{r kpi-tabelle}
+fmt_eur <- function(x) ifelse(is.na(x), "–", eur(x))
+fmt_pct <- function(x) ifelse(is.na(x), "–", pct(x))
+
+kpi <- tribble(
+  ~Kennzahl, ~Wert,
+  "Verträge gesamt",            zahl(n_vertraege),
+  "davon aktiv",                zahl(sum(dat$status == "aktiv", na.rm = TRUE)),
+  "davon storniert",            zahl(sum(dat$status == "Storno", na.rm = TRUE)),
+  "Exposure gesamt (Vertragsjahre)", zahl(sum(dat$haltedauer, na.rm = TRUE)),
+  "Prämie gesamt",              fmt_eur(sum(dat$praemie_ges, na.rm = TRUE)),
+  "Schadenaufwand gesamt",      fmt_eur(sum(dat$aufwand_ges, na.rm = TRUE)),
+  "Schadenquote Bestand (SQ Gesamt)",
+     fmt_pct(safe_rate(sum(dat$aufwand_ges, na.rm=TRUE),
+                       sum(dat$praemie_ges, na.rm=TRUE))),
+  "Verträge mit Großschaden",
+     zahl(sum(dat$gross_flag == 1, na.rm = TRUE)),
+  "Anteil Verträge untertarifiert",
+     fmt_pct(mean(dat$pricing_bew == "Untertarifiert", na.rm = TRUE))
+)
+kable(kpi, align = c("l","r"), caption = "Eckdaten des Gesamtbestands")
+```
+
+Die Tabelle verdichtet den Bestand auf wenige Steuerungsgrößen. Die folgenden
+Abschnitte schlüsseln diese Größen visuell auf.
+
+## Pricing-Bewertung des Bestands
+
+Das Feld `Pricing Bewertung` stuft jeden Vertrag anhand des Verhältnisses von
+erwartetem Schaden zu Prämie ein. Der Bestandsschnitt zeigt, ob die Tarifierung
+insgesamt auskömmlich ist.
+
+```{r pricing-bewertung}
+if (all(is.na(dat$pricing_bew))) {
+  cat("Spalte 'Pricing Bewertung' nicht im Export enthalten.")
+} else {
+  pb <- dat %>%
+    filter(!is.na(pricing_bew)) %>%
+    count(pricing_bew) %>%
+    mutate(anteil = n / sum(n))
+  ggplot(pb, aes(reorder(pricing_bew, n), n, fill = pricing_bew)) +
+    geom_col(width = .6) +
+    geom_text(aes(label = paste0(zahl(n), "  (", pct(anteil), ")")),
+              hjust = -.05, size = 3.6) +
+    scale_fill_manual(values = c("Übertarifiert" = farbe_grau,
+       "Auskömmlich" = farbe_haupt, "Untertarifiert" = farbe_akzent),
+       guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0,.18))) +
+    coord_flip() +
+    labs(title = "Pricing-Bewertung der Verträge",
+         subtitle = "Verteilung des Bestands nach Tarif-Auskömmlichkeit",
+         x = NULL, y = "Anzahl Verträge")
+}
+```
+
+```{r rel-fehler}
+if (!all(is.na(dat$rel_err))) {
+  ggplot(dat %>% filter(!is.na(rel_err)),
+         aes(pmax(pmin(rel_err, 1.5), -1))) +
+    geom_histogram(bins = 50, fill = farbe_haupt, color = "white", alpha = .9) +
+    geom_vline(xintercept = 0, color = farbe_akzent, linewidth = 1) +
+    scale_x_continuous(labels = pct) +
+    labs(title = "Verteilung des relativen Tariffehlers",
+         subtitle = "0 % = Prämie deckt erwarteten Schaden; rechts davon = untertarifiert",
+         x = "relativer Fehler (gekappt auf -100 % … +150 %)",
+         y = "Anzahl Verträge")
+}
+```
+
+## Schadenquote – Verteilung im Bestand
+
+```{r sq-verteilung}
+if (!all(is.na(dat$sq_ges))) {
+  ggplot(dat %>% filter(!is.na(sq_ges), sq_ges >= 0),
+         aes(winsor(sq_ges, .98))) +
+    geom_histogram(bins = 50, fill = farbe_haupt, color = "white", alpha = .9) +
+    geom_vline(xintercept = 1, color = farbe_akzent, linewidth = 1,
+               linetype = "dashed") +
+    scale_x_continuous(labels = pct) +
+    labs(title = "Verteilung der Schadenquote je Vertrag",
+         subtitle = "gestrichelt = 100 % (Schaden = Prämie); gekappt am 98 %-Quantil",
+         x = "Schadenquote (SQ Gesamt)", y = "Anzahl Verträge")
+}
+```
+
+Die meisten Verträge weisen eine niedrige Schadenquote auf; einige wenige
+Verträge mit hoher Quote (oft Großschäden) treiben den Bestandsschnitt – ein
+typisches Muster der Sachversicherung und Motiv für die getrennte
+Großschaden-Betrachtung in Kapitel 5.
+
+## Schadenquote je Gefahr
+
+```{r sq-je-gefahr}
+gefahr_kpi <- gefahr_long %>%
+  group_by(gefahr) %>%
+  summarise(
+    je_summe      = sum(je, na.rm = TRUE),
+    praemie_summe = sum(praemie, na.rm = TRUE),
+    aufwand_summe = sum(aufwand, na.rm = TRUE),
+    schaeden      = sum(claims, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sq        = safe_rate(aufwand_summe, praemie_summe),
+    frequenz  = safe_rate(schaeden, je_summe),
+    burning   = safe_rate(aufwand_summe, je_summe)
+  ) %>%
+  arrange(desc(sq))
+
+ggplot(gefahr_kpi %>% filter(!is.na(sq)),
+       aes(reorder(gefahr, sq), sq)) +
+  geom_col(fill = farbe_haupt, width = .65) +
+  geom_hline(yintercept = 1, color = farbe_akzent, linetype = "dashed") +
+  geom_text(aes(label = pct(sq)), hjust = -.1, size = 3.4) +
+  scale_y_continuous(labels = pct, expand = expansion(mult = c(0,.15))) +
+  coord_flip() +
+  labs(title = "Schadenquote je Gefahr",
+       subtitle = "Aufwand / Prämie der jeweiligen Gefahr; gestrichelt = 100 %",
+       x = NULL, y = "Schadenquote")
+```
+
+```{r praemie-aufwand}
+pa_long <- gefahr_kpi %>%
+  select(gefahr, Prämie = praemie_summe, Aufwand = aufwand_summe) %>%
+  pivot_longer(-gefahr, names_to = "groesse", values_to = "betrag")
+
+ggplot(pa_long, aes(reorder(gefahr, betrag), betrag, fill = groesse)) +
+  geom_col(position = "dodge", width = .7) +
+  scale_fill_manual(values = c("Prämie" = farbe_haupt, "Aufwand" = farbe_akzent),
+                    name = NULL) +
+  scale_y_continuous(labels = eur) +
+  coord_flip() +
+  labs(title = "Prämie vs. Schadenaufwand je Gefahr",
+       subtitle = "Gefahren, bei denen der Aufwand die Prämie übersteigt, sind defizitär",
+       x = NULL, y = NULL)
+```
+
+## Bestandsstruktur und Exposure
+
+```{r struktur, fig.height=4.2}
+p1 <- ggplot(dat %>% filter(!is.na(haltedauer)), aes(haltedauer)) +
+  geom_histogram(bins = 40, fill = farbe_haupt, color = "white", alpha = .9) +
+  labs(title = "Vertrags-Haltedauer", x = "Jahre", y = "Anzahl")
+
+p2 <- ggplot(dat %>% filter(!is.na(gebaeudealter)), aes(gebaeudealter)) +
+  geom_histogram(bins = 40, fill = "#548235", color = "white", alpha = .9) +
+  labs(title = "Gebäudealter", x = "Jahre", y = "Anzahl")
+
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  library(patchwork); p1 + p2
+} else { print(p1); print(p2) }
+```
+
+```{r exposure-tarif}
+if (!all(is.na(dat$tarif))) {
+  dat %>%
+    mutate(tarif = top_n_other(tarif, 6)) %>%
+    group_by(tarif) %>%
+    summarise(exposure = sum(haltedauer, na.rm = TRUE), n = n(),
+              .groups = "drop") %>%
+    ggplot(aes(reorder(tarif, exposure), exposure)) +
+    geom_col(fill = farbe_haupt, width = .65) +
+    geom_text(aes(label = zahl(n)), hjust = -.15, size = 3.3) +
+    scale_y_continuous(labels = zahl, expand = expansion(mult = c(0,.15))) +
+    coord_flip() +
+    labs(title = "Exposure (Vertragsjahre) je Tarifausprägung",
+         subtitle = "Balkenbeschriftung = Anzahl Verträge",
+         x = NULL, y = "Summe Vertragsjahre")
+}
+```
+
+## Regionale Sicht – Schadenquote nach ZÜRS-Zone
+
+```{r region-zuers}
+if (!all(is.na(dat$zuers))) {
+  dat %>%
+    filter(!is.na(zuers), !is.na(aufwand_ges), !is.na(praemie_ges)) %>%
+    group_by(zuers) %>%
+    summarise(sq = safe_rate(sum(aufwand_ges), sum(praemie_ges)),
+              n = n(), .groups = "drop") %>%
+    ggplot(aes(zuers, sq, fill = sq)) +
+    geom_col(width = .6) +
+    geom_text(aes(label = pct(sq)), vjust = -.5, size = 3.6) +
+    scale_fill_gradient(low = farbe_haupt, high = farbe_akzent, guide = "none") +
+    scale_y_continuous(labels = pct, expand = expansion(mult = c(0,.15))) +
+    labs(title = "Schadenquote nach ZÜRS-Zone",
+         subtitle = "ZÜRS-Zonen bündeln das Elementar-/Überschwemmungsrisiko",
+         x = NULL, y = "Schadenquote")
+}
+```
+
+## Großschaden-Überblick
+
+```{r gross-ueberblick}
+gross <- tibble(
+  Kennzahl = c("Verträge mit Großschaden",
+               "Anteil am Bestand",
+               "Großschadenaufwand gesamt",
+               "Ø Großschaden",
+               "Anteil Großschaden am Gesamtaufwand"),
+  Wert = c(
+    zahl(sum(dat$gross_flag == 1, na.rm = TRUE)),
+    pct(mean(dat$gross_flag == 1, na.rm = TRUE)),
+    fmt_eur(sum(dat$gross_auf, na.rm = TRUE)),
+    fmt_eur(mean(dat$gross_auf[dat$gross_flag == 1], na.rm = TRUE)),
+    fmt_pct(safe_rate(sum(dat$gross_auf, na.rm = TRUE),
+                      sum(dat$aufwand_ges, na.rm = TRUE)))
+  )
+)
+kable(gross, align = c("l","r"), caption = "Großschäden im Gesamtbestand")
+```
+
+---
+
+# Tiefenanalyse Wohngebäude
+
+Die Gefahr **Wohngebäude** ist die Kerndeckung des Produkts. Bezugsgröße für
+Frequenz und Schadenbedarf ist `JE Wohngebäude` (gefahrenscharfe Exposure).
+
+```{r wg-basis}
+wg <- gefahr_long %>%
+  filter(gefahr == "Wohngebäude") %>%
+  left_join(merkmale, by = ".rid") %>%
+  mutate(frequenz = safe_rate(claims, je),
+         burning  = safe_rate(aufwand, je))
+```
+
+## Schadenfrequenz nach Gebäudealter
+
+```{r wg-freq-alter}
+if (!all(is.na(wg$alter_band))) {
+  wg %>%
+    filter(!is.na(alter_band), je > 0) %>%
+    group_by(alter_band) %>%
+    summarise(frequenz = safe_rate(sum(claims), sum(je)),
+              je = sum(je), .groups = "drop") %>%
+    ggplot(aes(alter_band, frequenz)) +
+    geom_col(fill = farbe_haupt, width = .65) +
+    geom_text(aes(label = pct(frequenz)), vjust = -.5, size = 3.5) +
+    scale_y_continuous(labels = pct, expand = expansion(mult = c(0,.15))) +
+    labs(title = "Wohngebäude – Schadenfrequenz nach Gebäudealter",
+         subtitle = "Schäden je Jahreseinheit (JE Wohngebäude)",
+         x = NULL, y = "Frequenz")
+}
+```
+
+## Schadenbedarf nach Bauartklasse
+
+```{r wg-burning-bauklasse}
+if (!all(is.na(wg$bauklasse))) {
+  wg %>%
+    filter(!is.na(bauklasse), je > 0) %>%
+    mutate(bauklasse = top_n_other(bauklasse, 6)) %>%
+    group_by(bauklasse) %>%
+    summarise(burning = safe_rate(sum(aufwand), sum(je)),
+              .groups = "drop") %>%
+    ggplot(aes(reorder(bauklasse, burning), burning)) +
+    geom_col(fill = farbe_akzent, width = .65) +
+    geom_text(aes(label = eur(burning)), hjust = -.1, size = 3.4) +
+    scale_y_continuous(labels = eur, expand = expansion(mult = c(0,.18))) +
+    coord_flip() +
+    labs(title = "Wohngebäude – Schadenbedarf je Bauartklasse",
+         subtitle = "Schadenaufwand je Jahreseinheit (Burning Cost)",
+         x = NULL, y = "Schadenbedarf je JE")
+}
+```
+
+## Schadenbedarf nach Wohnflächenklasse
+
+```{r wg-wohnflaeche}
+if (!all(is.na(wg$wohnflaeche_band))) {
+  wg %>%
+    filter(!is.na(wohnflaeche_band), je > 0) %>%
+    group_by(wohnflaeche_band) %>%
+    summarise(burning = safe_rate(sum(aufwand), sum(je)),
+              frequenz = safe_rate(sum(claims), sum(je)), .groups = "drop") %>%
+    ggplot(aes(wohnflaeche_band, burning)) +
+    geom_col(fill = farbe_haupt, width = .65) +
+    geom_text(aes(label = eur(burning)), vjust = -.5, size = 3.4) +
+    scale_y_continuous(labels = eur, expand = expansion(mult = c(0,.15))) +
+    labs(title = "Wohngebäude – Schadenbedarf nach Wohnfläche",
+         x = "Wohnfläche (m²)", y = "Schadenbedarf je JE")
+}
+```
+
+---
+
+# Tiefenanalyse Leitungswasser
+
+Leitungswasser ist erfahrungsgemäß die frequenzstärkste Gefahr. Entscheidend
+für eine korrekte Auswertung ist, dass als Exposure `JE Leitungswasser`
+verwendet wird – **nicht** die Vertrags-Haltedauer.
+
+## Warum die gefahrenscharfe Exposure zählt
+
+```{r lw-exposure-vergleich}
+lw <- gefahr_long %>% filter(gefahr == "Leitungswasser")
+lw_cmp <- lw %>% left_join(select(merkmale, .rid, haltedauer), by = ".rid")
+
+ggplot(lw_cmp %>% filter(!is.na(je), !is.na(haltedauer)),
+       aes(haltedauer, je)) +
+  geom_abline(slope = 1, intercept = 0, color = farbe_akzent,
+              linewidth = 1, linetype = "dashed") +
+  geom_point(alpha = .25, color = farbe_haupt) +
+  labs(title = "Leitungswasser-Exposure vs. Vertrags-Haltedauer",
+       subtitle = paste("Punkte unter der Linie: LW später eingeschlossen",
+                         "als der Vertrag begann – hier wäre die Haltedauer",
+                         "als Nenner zu groß"),
+       x = "Haltedauer Vertrag (Jahre)", y = "JE Leitungswasser (Jahre)")
+```
+
+```{r lw-exposure-effekt, results='asis'}
+eff <- lw_cmp %>%
+  filter(!is.na(je), !is.na(haltedauer), je > 0) %>%
+  summarise(anteil_kuerzer = mean(je < haltedauer - 0.05),
+            mittel_verkuerzung = 1 - mean(je / haltedauer))
+cat(sprintf(paste0("Bei **%s** der Leitungswasser-Verträge ist die ",
+  "gefahrenscharfe Exposure kürzer als die Vertrags-Haltedauer; im Mittel ",
+  "um **%s**. Würde weiterhin die Haltedauer als Nenner verwendet, wäre die ",
+  "Leitungswasser-Frequenz im Bestand entsprechend zu niedrig ausgewiesen.\n"),
+  pct(eff$anteil_kuerzer), pct(eff$mittel_verkuerzung)))
+```
+
+## Leitungswasser-Frequenz nach Region und Gebäudealter
+
+```{r lw-freq}
+lw_d <- lw %>%
+  left_join(select(merkmale, .rid, zuers, alter_band, bundesland),
+            by = ".rid") %>%
+  mutate(frequenz = safe_rate(claims, je))
+
+if (!all(is.na(lw_d$alter_band))) {
+  lw_d %>%
+    filter(!is.na(alter_band), je > 0) %>%
+    group_by(alter_band) %>%
+    summarise(frequenz = safe_rate(sum(claims), sum(je)), .groups = "drop") %>%
+    ggplot(aes(alter_band, frequenz)) +
+    geom_col(fill = farbe_haupt, width = .65) +
+    geom_text(aes(label = pct(frequenz)), vjust = -.5, size = 3.5) +
+    scale_y_continuous(labels = pct, expand = expansion(mult = c(0,.15))) +
+    labs(title = "Leitungswasser – Frequenz nach Gebäudealter",
+         subtitle = "ältere Installationen führen tendenziell zu mehr Schäden",
+         x = NULL, y = "Frequenz je JE")
+}
+```
+
+## Burning Cost je ZÜRS-Zone mit Bühlmann-Straub-Glättung
+
+```{r lw-credibility}
+# eindimensionale Buehlmann-Straub-Credibility: Gewicht = JE Leitungswasser
+buehlmann_straub <- function(risk, weight, observation) {
+  d <- tibble(risk = risk, w = weight, X = observation) %>%
+    filter(is.finite(w), w > 0, is.finite(X))
+  if (nrow(d) < 2 || dplyr::n_distinct(d$risk) < 2) return(NULL)
+  agg <- d %>% group_by(risk) %>%
+    summarise(w_i = sum(w), B_i = sum(w*X)/sum(w), .groups = "drop")
+  w_tot <- sum(agg$w_i); mu <- sum(agg$w_i*agg$B_i)/w_tot
+  ss_w  <- d %>% left_join(agg, by="risk") %>%
+           summarise(s = sum(w*(X-B_i)^2)) %>% pull(s)
+  sigma2 <- ss_w / (nrow(d) - nrow(agg))
+  ss_b   <- sum(agg$w_i*(agg$B_i-mu)^2) - (nrow(agg)-1)*sigma2
+  cc     <- w_tot - sum(agg$w_i^2)/w_tot
+  tau2   <- max(ss_b/cc, 0)
+  agg %>% mutate(mu = mu,
+    alpha  = if (tau2 > 0) w_i/(w_i + sigma2/tau2) else 0,
+    P_cred = alpha*B_i + (1-alpha)*mu)
+}
+
+lw_bc <- lw_d %>% filter(!is.na(zuers), je > 0) %>%
+  mutate(burning = safe_rate(aufwand, je))
+cred <- buehlmann_straub(lw_bc$zuers, lw_bc$je, lw_bc$burning)
+
+if (!is.null(cred)) {
+  cred_long <- cred %>%
+    select(risk, Beobachtet = B_i, `Credibility` = P_cred) %>%
+    pivot_longer(-risk, names_to = "art", values_to = "wert")
+  ggplot(cred_long, aes(risk, wert, fill = art)) +
+    geom_col(position = "dodge", width = .7) +
+    geom_hline(yintercept = unique(cred$mu), color = farbe_grau,
+               linetype = "dashed") +
+    scale_fill_manual(values = c("Beobachtet" = farbe_grau,
+                                 "Credibility" = farbe_haupt), name = NULL) +
+    scale_y_continuous(labels = eur) +
+    labs(title = "Leitungswasser – Burning Cost je ZÜRS-Zone",
+         subtitle = paste("Bühlmann-Straub-Glättung: kleine Zonen werden zum",
+                           "Kollektivmittel (gestrichelt) gezogen"),
+         x = NULL, y = "Schadenbedarf je JE")
+} else {
+  cat("Zu wenige Zonen für eine Credibility-Schätzung.")
+}
+```
+
+---
+
+# Tiefenanalyse Großschaden
+
+Großschäden werden separat betrachtet, da sie den Schadenbedarf stark
+verzerren. Grundlage sind die Felder `Hat Großschaden`, `Aufwand Großschaden`
+und `GROSSSCHADEN`.
+
+## Häufigkeit und Aufwand
+
+```{r gross-haeufigkeit, fig.height=4.2}
+gs <- dat %>% filter(gross_flag == 1, !is.na(gross_auf), gross_auf > 0)
+
+dat_gs <- dat %>%
+  mutate(gs_lab = factor(gross_flag, levels = c(0,1),
+                         labels = c("kein Großschaden","Großschaden")))
+p_n <- ggplot(dat_gs, aes(gs_lab, fill = gs_lab)) +
+  geom_bar(width = .6) +
+  scale_fill_manual(values = c("kein Großschaden" = farbe_haupt,
+                               "Großschaden" = farbe_akzent), guide = "none") +
+  labs(title = "Verträge mit/ohne Großschaden", x = NULL, y = "Anzahl")
+
+p_a <- if (nrow(gs) > 0) {
+  ggplot(gs, aes(winsor(gross_auf, .97))) +
+    geom_histogram(bins = 35, fill = farbe_akzent, color = "white", alpha=.9) +
+    scale_x_continuous(labels = eur) +
+    labs(title = "Verteilung des Großschadenaufwands",
+         x = "Aufwand je Großschaden", y = "Anzahl")
+} else NULL
+
+print(p_n); if (!is.null(p_a)) print(p_a)
+```
+
+## Großschäden je Gefahr
+
+```{r gross-je-gefahr}
+# Verträge mit Großschaden den Gefahren mit hohem Aufwand zuordnen
+gs_gefahr <- gefahr_long %>%
+  left_join(select(merkmale, .rid, gross_flag), by = ".rid") %>%
+  filter(gross_flag == 1, !is.na(aufwand)) %>%
+  group_by(gefahr) %>%
+  summarise(aufwand = sum(aufwand, na.rm = TRUE), .groups = "drop") %>%
+  filter(aufwand > 0)
+
+if (nrow(gs_gefahr) > 0) {
+  ggplot(gs_gefahr, aes(reorder(gefahr, aufwand), aufwand)) +
+    geom_col(fill = farbe_akzent, width = .65) +
+    geom_text(aes(label = eur(aufwand)), hjust = -.1, size = 3.3) +
+    scale_y_continuous(labels = eur, expand = expansion(mult = c(0,.2))) +
+    coord_flip() +
+    labs(title = "Schadenaufwand der Großschaden-Verträge je Gefahr",
+         x = NULL, y = "Schadenaufwand")
+}
+```
+
+## Effekt der Großschäden auf die Schadenquote
+
+```{r gross-effekt, results='asis'}
+sq_mit  <- safe_rate(sum(dat$aufwand_ges, na.rm = TRUE),
+                     sum(dat$praemie_ges, na.rm = TRUE))
+sq_ohne <- safe_rate(sum(dat$aufwand_ges, na.rm = TRUE) -
+                       sum(dat$gross_auf, na.rm = TRUE),
+                     sum(dat$praemie_ges, na.rm = TRUE))
+cat(sprintf(paste0("Die Bestands-Schadenquote beträgt **%s** inklusive und ",
+  "**%s** ohne Großschäden. Die Differenz von **%s-Punkten** zeigt den ",
+  "Hebel der Großschäden – sie begründet, Tarifierung und Reservierung der ",
+  "Großschäden getrennt vom Kernschadenbedarf zu betrachten.\n"),
+  pct(sq_mit), pct(sq_ohne), pct(sq_mit - sq_ohne)))
+```
+
+---
+
+# Frequenz- und Severity-Modelle (kompakt)
+
+Aufbauend auf der EDA wird beispielhaft ein Frequenzmodell für Leitungswasser
+geschätzt. Der Offset ist `log(JE Leitungswasser)` – die gefahrenscharfe
+Exposure.
+
+```{r modell-freq}
+model_df <- lw_d %>%
+  transmute(
+    claim_count    = pmax(0, round(claims)),
+    exposure_years = je,
+    zuers          = top_n_other(zuers, 8),
+    alter_band     = factor(ifelse(is.na(alter_band), "unbekannt",
+                                   as.character(alter_band)))
+  ) %>%
+  filter(!is.na(exposure_years), exposure_years > 0)
+
+freq_nb <- NULL
+if (hat_MASS && nrow(model_df) > 50 && sum(model_df$claim_count) > 0) {
+  freq_nb <- tryCatch(
+    MASS::glm.nb(
+      claim_count ~ offset(log(exposure_years)) + zuers + alter_band,
+      data = model_df),
+    error = function(e) NULL)
+  if (!is.null(freq_nb)) {
+    print(summary(freq_nb))
+  } else {
+    cat("Modell nicht konvergiert – bitte Segmentierung prüfen.")
+  }
+} else {
+  cat("Modell übersprungen (Paket 'MASS' fehlt oder zu wenig Schadenfälle).")
+}
+```
+
+```{r modell-koeff}
+if (exists("freq_nb") && !is.null(freq_nb)) {
+  ko <- tryCatch({
+    cf <- summary(freq_nb)$coefficients
+    tibble(Term = rownames(cf), Schaetzer = cf[,1],
+           exp_Effekt = exp(cf[,1])) %>%
+      filter(Term != "(Intercept)")
+  }, error = function(e) NULL)
+  if (!is.null(ko)) {
+    ggplot(ko, aes(reorder(Term, exp_Effekt), exp_Effekt)) +
+      geom_hline(yintercept = 1, color = farbe_grau, linetype = "dashed") +
+      geom_col(fill = farbe_haupt, width = .6) +
+      coord_flip() +
+      labs(title = "Leitungswasser-Frequenzmodell – relative Effekte",
+           subtitle = "Werte > 1 erhöhen, < 1 senken die erwartete Schadenzahl",
+           x = NULL, y = "multiplikativer Effekt (exp ß)")
+  }
+}
+```
+
+---
+
+# Zusammenfassung und nächste Schritte
+
+```{r fazit, echo=FALSE, results='asis'}
+cat(paste0(
+"- **Portfolio-EDA**: Der Bestand umfasst ", zahl(n_vertraege),
+" Verträge. Die Pricing-Bewertung und die Schadenquote je Gefahr zeigen, ",
+"welche Gefahren defizitär sind und Tarifaufmerksamkeit brauchen.\n",
+"- **Wohngebäude**: Frequenz und Schadenbedarf steigen mit Gebäudealter und ",
+"variieren nach Bauartklasse – relevante Tarifmerkmale.\n",
+"- **Leitungswasser**: Die gefahrenscharfe Exposure (JE Leitungswasser) ist ",
+"systematisch kürzer als die Vertrags-Haltedauer; nur mit ihr sind Frequenz ",
+"und Schadenbedarf unverzerrt.\n",
+"- **Großschaden**: Großschäden heben die Bestands-Schadenquote spürbar an ",
+"und sollten getrennt tarifiert und reserviert werden.\n",
+"- **Nächste Schritte**: Frequenz-/Severity-Modelle je Kerngefahr verfeinern, ",
+"Großschadenschwelle statistisch fixieren und die Credibility-Glättung auf ",
+"weitere Segmente (Bauartklasse, Region) ausweiten.\n"))
+```
+
+```{r sessioninfo, echo=FALSE}
+cat("Erstellt am", format(Sys.time(), "%d.%m.%Y %H:%M"),
+    "| Modus:", if (demo_modus) "DEMODATEN" else "Echtdaten")
+```
