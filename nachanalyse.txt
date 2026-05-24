@@ -1,0 +1,25 @@
+Nach EDA und Frequenzmodell ist der nächste logische Schritt, die Modellstrecke zu vervollständigen und dann auf Steuerung und Risikotransfer auszuweiten. Ein Vorschlag, gegliedert nach dem, was direkt mit dem jetzigen Auszug geht, und dem, was einen erweiterten Auszug braucht.
+
+**Direkt mit dem vorhandenen Auszug möglich**
+
+1. **Schadenhöhenmodell und Nettorisikoprämie** – Das Frequenzmodell ruft nach seinem Gegenstück: ein Severity-Modell auf `Sev <Gefahr>` (GLM Gamma oder Lognormal, bedingt auf Verträge mit Schaden, gewichtet mit der Schadenanzahl). Frequenz × Severity ergibt die Nettorisikoprämie je Vertrag und Gefahr – das eigentliche Tarifmodell. Damit wird `Pricing Bewertung` von einer groben Einstufung zu einer sauber hergeleiteten technischen Prämie, segmentscharf mit konkreten Auf- und Abschlägen.
+
+2. **Modellvalidierung** – Bevor etwas in die Tarifierung geht: Actual-vs-Expected je Segment, Lift-Kurven, Gini/Konzentrationskurve, Residuenanalyse. Liegen mehrere Stichtage vor, zusätzlich eine Out-of-Time-Validierung.
+
+3. **Großschaden- und Extremwertanalyse** – Statt einer fest gesetzten Schwelle die Großschadengrenze datengetrieben bestimmen (Mean-Excess-Plot, Peaks-over-Threshold mit verallgemeinerter Pareto-Verteilung). Ergebnis: ein belastbarer Großschadenzuschlag und die Tail-Verteilung – Grundlage für die Rückversicherung.
+
+4. **Profitabilität nach Segment** – `SQ Gesamt`, `EL Gesamt` und `Prämie Gesamt` nach Vermittler, Mandant, Tarifausprägung und Region auswerten (Schadenquote, perspektivisch Combined Ratio mit Kostenquote). Das ist die klassische Bestandssteuerung eines Assekuradeurs und deckt systematisch defizitäre Kohorten auf.
+
+5. **Storno-/Bestandsanalyse** – Aus `S_STATUS_V`, Vertragsbeginn und Storno-Datum lässt sich die Stornowahrscheinlichkeit modellieren (logistische Regression oder Überlebenszeitanalyse). Spannend ist die Verknüpfung mit der Profitabilität: Stornieren eher die guten oder die schlechten Risiken?
+
+**Mit erweitertem Datenauszug**
+
+6. **Schadenreservierung** – Für Chain-Ladder und Bornhuetter-Ferguson (RBNS/IBNER/IBNR) brauchst du Schadendaten mit Schaden- und Zahlungsdatum, um Abwicklungsdreiecke je Gefahr aufzubauen. Der jetzige Auszug ist eine Momentaufnahme zum Stichtag – die Entwicklungsdimension fehlt noch.
+
+7. **Rückversicherungsanalyse** – Auf der Großschaden-/EVT-Analyse aufsetzend: Selbstbehalt und XL-Layer simulieren, erwartete Abgaben und Entlastung rechnen, das Programm (WXL/CatXL) optimieren. Für die Cat-Komponente die ZÜRS-Zonen als Akkumulationssicht nutzen.
+
+8. **Akkumulations-/Kumulkontrolle** – Geografische Häufung der Elementar- und Sturmexposition, PML-Schätzung je ZÜRS-Zone, Szenariorechnung (z. B. Hochwasser).
+
+Eine elegante Erweiterung deiner bestehenden ZÜRS-Credibility wäre außerdem die mehrdimensionale Bühlmann-Straub-Variante (Kapitel 7 deines Lehrbuchs), die mehrere Gefahren gemeinsam glättet, statt jede einzeln.
+
+Mein Vorschlag für den unmittelbar nächsten Schritt ist **Nr. 1** – Severity-Modell und Nettorisikoprämie: Es setzt direkt auf dem Frequenzmodell auf, braucht keinen neuen Datenauszug und unterfüttert die Pricing-Bewertung methodisch sauber. Wenn du möchtest, baue ich dir das als nächstes `.Rmd`.
