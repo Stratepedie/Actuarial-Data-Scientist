@@ -1,0 +1,738 @@
+---
+title: "Feature- und Modellselektion (EFH)"
+subtitle: "Merkmalsauswahl mit mehreren ML-Verfahren · Kreuzvalidierung · Modellvergleich"
+author: "Aktuariat"
+date: "`r format(Sys.Date(), '%d.%m.%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 9, fig.height = 5, dpi = 110, fig.align = "center"
+)
+options(scipen = 999)
+```
+
+# Ziel und Vorgehen
+
+Dieser Bericht wählt aus den verfügbaren Vertrags- und Objektmerkmalen jene
+aus, die die **Schadenfrequenz** der Gefahr Leitungswasser am besten erklären.
+Dazu werden mehrere Verfahren mit unterschiedlichem Selektionsmechanismus
+gegeneinander gestellt und über **k-fache Kreuzvalidierung** verglichen:
+
+| Verfahren | Selektionsmechanismus |
+|---|---|
+| Poisson-GLM (Referenz) | keine – nutzt alle Merkmale |
+| Schrittweise Selektion (AIC) | Vorwärts/Rückwärts nach AIC |
+| Elastic Net (`glmnet`) | L1-Regularisierung (Koeffizient = 0) |
+| Random Forest (`ranger`) | Permutations-Wichtigkeit |
+| Gradient Boosting (`xgboost`) | Gain-Wichtigkeit |
+| Naiv (nur Mittelwert) | keine Merkmale – Benchmark |
+
+**Ergebnisgrößen je Modell:** Anzahl gewählter Merkmale, Merkmalsliste,
+CV-Poisson-Devianz, CV-RMSE, erklärte Devianz sowie der modell-implizierte
+**Expected Loss** (erwarteter Schadenaufwand des Bestands).
+
+Aus dem Vergleich aller Modelle wird abschließend eine **universelle
+Merkmalsauswahl** abgeleitet – die Merkmale, auf die sich die Verfahren einigen.
+
+```{r pakete}
+# Basis-Pakete (zwingend)
+basis <- c("dplyr","tidyr","purrr","ggplot2","readr","stringr","forcats",
+           "scales","knitr","tibble")
+for (p in basis) if (!requireNamespace(p, quietly = TRUE))
+  install.packages(p, repos = "https://cloud.r-project.org")
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(purrr); library(ggplot2)
+  library(readr); library(stringr); library(forcats); library(scales)
+  library(knitr); library(tibble)
+})
+# ML-Pakete (optional – Modell wird sonst übersprungen)
+hat_MASS    <- requireNamespace("MASS",    quietly = TRUE)
+hat_glmnet  <- requireNamespace("glmnet",  quietly = TRUE)
+hat_ranger  <- requireNamespace("ranger",  quietly = TRUE)
+hat_xgboost <- requireNamespace("xgboost", quietly = TRUE)
+hat_readxl  <- requireNamespace("readxl",  quietly = TRUE)
+```
+
+```{r theme}
+farbe_haupt <- "#2E75B6"; farbe_akzent <- "#C00000"; farbe_grau <- "#7F7F7F"
+farbe_gut   <- "#548235"
+theme_dom <- function(base = 12) {
+  theme_minimal(base_size = base, base_family = "sans") +
+    theme(
+      plot.title    = element_text(face = "bold", size = base + 3),
+      plot.subtitle = element_text(color = farbe_grau, size = base - 1),
+      axis.title    = element_text(color = farbe_grau),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      legend.position = "bottom",
+      strip.text = element_text(face = "bold"))
+}
+theme_set(theme_dom())
+eur  <- label_number(big.mark = ".", decimal.mark = ",", suffix = " \u20AC",
+                     accuracy = 1)
+pct  <- label_percent(big.mark = ".", decimal.mark = ",", accuracy = 0.1)
+zahl <- label_number(big.mark = ".", decimal.mark = ",", accuracy = 1)
+zah2 <- label_number(big.mark = ".", decimal.mark = ",", accuracy = 0.001)
+```
+
+```{r helfer}
+# Spaltennamen kanonisieren (Umlaute / Sonderzeichen aufloesen)
+cz <- function(x) {
+  x <- trimws(x)
+  x <- gsub("\u00e4","ae",x); x <- gsub("\u00f6","oe",x); x <- gsub("\u00fc","ue",x)
+  x <- gsub("\u00c4","Ae",x); x <- gsub("\u00d6","Oe",x); x <- gsub("\u00dc","Ue",x)
+  x <- gsub("\u00df","ss",x)
+  x <- gsub("[^A-Za-z0-9]+","_",x); gsub("^_|_$","",x)
+}
+num_clean <- function(x) {
+  if (is.numeric(x)) return(x)
+  x <- as.character(x)
+  x <- str_replace_all(x, "[^0-9,.\\-]", "")
+  x <- str_replace_all(x, "\\.", "")
+  x <- str_replace_all(x, ",", ".")
+  suppressWarnings(as.numeric(x))
+}
+char_clean <- function(x) {
+  x <- str_squish(as.character(x))
+  x[x %in% c("","NA","null","NULL","-","- ohne -")] <- NA
+  x
+}
+hat  <- function(df, sp) cz(sp) %in% names(df)
+holn <- function(df, sp) if (hat(df, sp)) num_clean(df[[cz(sp)]]) else NA_real_
+holc <- function(df, sp) if (hat(df, sp)) char_clean(df[[cz(sp)]]) else NA_character_
+
+# seltene Faktorstufen buendeln + fehlende Werte als "unbekannt"
+fct_lump <- function(x, n = 10) {
+  x <- as.character(x); x[is.na(x)] <- "unbekannt"
+  top <- names(sort(table(x), decreasing = TRUE))
+  top <- top[seq_len(min(n, length(top)))]
+  factor(ifelse(x %in% top, x, "Sonstige"))
+}
+# Median-Imputation fuer numerische Merkmale
+imp_med <- function(x) { x[is.na(x)] <- median(x, na.rm = TRUE); x }
+
+# mittlere Poisson-Devianz (Modellguetemass fuer Zaehldaten)
+poisson_dev <- function(y, mu) {
+  mu <- pmax(mu, 1e-9)
+  term <- ifelse(y > 0, y * log(y / mu), 0)
+  2 * mean(term - (y - mu))
+}
+```
+
+```{r demodaten}
+# =============================================================================
+# Demo-Datengenerator mit echtem Merkmalssignal
+# -----------------------------------------------------------------------------
+# Signal:  gebaeudealter, ZÜRS-Zone, Bauartklasse, Dach, (schwach) Wohnfläche
+# Rauschen: Alter VN, Nutzungsart, Tarif, Nachhaltigkeit  -> sollten verworfen
+#           werden. Wird nur genutzt, wenn keine echte Datei gefunden wird.
+# =============================================================================
+simuliere_demodaten <- function(n = 3500, seed = 2026) {
+  set.seed(seed)
+  beginn <- as.Date("2026-05-02") - round(runif(n, 30, 365.25*14))
+  storno <- runif(n) < 0.1
+  ende   <- as.Date(ifelse(storno, as.numeric(beginn)+round(runif(n,100,2500)),
+              as.numeric(as.Date("2026-05-02"))), origin = "1970-01-01")
+  halte  <- pmax(0.1, as.numeric(ende - beginn) / 365.25)
+
+  baujahr <- pmin(pmax(round(rnorm(n, 1985, 26)), 1900), 2025)
+  galter  <- 2026 - baujahr
+  wohnfl  <- round(pmax(40, rnorm(n, 145, 55)))
+  zuers   <- sample(paste0("ZÜRS ", 1:4), n, TRUE, prob = c(.55,.25,.15,.05))
+  bauk    <- sample(c("BAK 1","BAK 2","BAK 3"), n, TRUE, prob = c(.7,.22,.08))
+  bauart  <- sample(c("massiv","Fachwerk","Holz","gemischt"), n, TRUE,
+                    prob = c(.78,.08,.06,.08))
+  dach    <- sample(c("hart","weich"), n, TRUE, prob = c(.9,.1))
+  nutzung <- sample(c("eigengenutzt","vermietet","gemischt"), n, TRUE,
+                    prob = c(.75,.18,.07))
+  tarif   <- sample(c("Basis","Komfort","Standard","Top"), n, TRUE)
+  nachh   <- sample(c("Ja","Nein"), n, TRUE, prob = c(.22,.78))
+  altervn <- round(pmax(19, rnorm(n, 52, 14)))
+
+  # linearer Praediktor der Leitungswasser-Frequenz (nur Signalmerkmale)
+  eff_zuers <- c("ZÜRS 1"=0,"ZÜRS 2"=.12,"ZÜRS 3"=.28,"ZÜRS 4"=.45)
+  eff_bauk  <- c("BAK 1"=0,"BAK 2"=.18,"BAK 3"=.33)
+  eff_dach  <- c("hart"=0,"weich"=.20)
+  lp <- -2.55 +
+        0.022 * pmax(galter - 20, 0) +
+        eff_zuers[zuers] + eff_bauk[bauk] + eff_dach[dach] +
+        0.0016 * (wohnfl - 140)
+  freq <- exp(lp)
+
+  je_lw  <- round(halte * ifelse(runif(n) < .25, runif(n,.4,.95), 1), 2)
+  claims <- rpois(n, freq * je_lw)
+  sev    <- round(rlnorm(n, log(2600), .75))
+  aufwand<- claims * sev
+
+  tibble(
+    VSNR_V = sprintf("IDCPT-04-%07d", seq_len(n)),
+    S_STATUS_V = ifelse(storno, "Storno", "aktiv"),
+    `Haltedauer in Jahren` = round(halte, 2),
+    `Alter VN` = altervn,
+    BAUJAHR_WGB = baujahr, WOHNFLAECHEQM_WGB = wohnfl,
+    ZUERSZONE_WGB = zuers, BAUARTKLASSE_WGB = bauk,
+    BAUARTGEBAEUDE_WGB = bauart, MATERIALDACH_WGB = dach,
+    NUTZUNGSART_WGB = nutzung, `Tarifausprägung` = tarif,
+    NACHHALTIGKEIT = nachh,
+    `JE Leitungswasser` = je_lw,
+    `Claims Leitungswasser` = claims,
+    `Aufwand Leitungswasser` = aufwand,
+    `Sev Leitungswasser` = ifelse(claims > 0, round(aufwand/claims), 0)
+  )
+}
+```
+
+```{r daten-laden}
+# >>> Pfad zum echten SQL-Export eintragen (CSV ';' oder XLSX) <<<
+pfad_daten  <- "Bestand_EFH_Export.csv"
+ziel_gefahr <- "Leitungswasser"   # modellierte Gefahr
+
+if (file.exists(pfad_daten)) {
+  ext <- tolower(tools::file_ext(pfad_daten))
+  roh <- if (ext %in% c("xlsx","xls") && hat_readxl) {
+    readxl::read_excel(pfad_daten)
+  } else {
+    readr::read_delim(pfad_daten, delim = ";",
+      locale = locale(encoding = "Latin1"),
+      show_col_types = FALSE, name_repair = "minimal")
+  }
+  demo_modus <- FALSE
+} else {
+  roh <- simuliere_demodaten(); demo_modus <- TRUE
+}
+names(roh) <- cz(names(roh))
+roh <- as_tibble(roh)
+```
+
+```{r demo-hinweis, results='asis', echo=FALSE}
+if (demo_modus) {
+  cat('<div style="background:#FFF3CD;border-left:6px solid #BF8F00;',
+      'padding:10px 14px;border-radius:4px;">',
+      '<b>Hinweis – Demo-Modus.</b> Unter <code>', pfad_daten, '</code> ',
+      'wurde keine Datei gefunden. Der Bericht läuft mit ',
+      '<b>simulierten Beispieldaten</b> (mit eingebautem Merkmalssignal), ',
+      'damit Feature- und Modellselektion sofort nachvollziehbar sind. ',
+      'Für die echte Auswertung bitte den Pfad oben setzen.</div>', sep = "")
+}
+```
+
+# Zielgröße und Merkmale
+
+```{r modellrahmen}
+# -----------------------------------------------------------------------------
+# Modellierungsdatensatz: Ziel = Schadenanzahl, Exposure = JE der Zielgefahr
+# -----------------------------------------------------------------------------
+md <- tibble(
+  claims        = pmax(0, round(holn(roh, paste0("Claims ", ziel_gefahr)))),
+  expo          = holn(roh, paste0("JE ", ziel_gefahr)),
+  gebaeudealter = {
+    bj <- holn(roh, "BAUJAHR_WGB")
+    ifelse(!is.na(bj) & bj > 1700,
+           as.integer(format(Sys.Date(), "%Y")) - bj, NA)
+  },
+  wohnflaeche = holn(roh, "WOHNFLAECHEQM_WGB"),
+  alter_vn    = holn(roh, "Alter VN"),
+  zuers       = holc(roh, "ZUERSZONE_WGB"),
+  bauklasse   = holc(roh, "BAUARTKLASSE_WGB"),
+  bauart      = holc(roh, "BAUARTGEBAEUDE_WGB"),
+  dach        = holc(roh, "MATERIALDACH_WGB"),
+  nutzung     = holc(roh, "NUTZUNGSART_WGB"),
+  tarif       = holc(roh, "Tarifausprägung"),
+  nachhaltig  = holc(roh, "NACHHALTIGKEIT")
+) %>%
+  filter(!is.na(expo), expo > 0, !is.na(claims)) %>%
+  mutate(
+    across(c(gebaeudealter, wohnflaeche, alter_vn), imp_med),
+    across(c(zuers, bauklasse, bauart, dach, nutzung, tarif, nachhaltig),
+           fct_lump)
+  )
+
+# Kandidatenmerkmale
+features <- c("gebaeudealter","wohnflaeche","alter_vn","zuers","bauklasse",
+              "bauart","dach","nutzung","tarif","nachhaltig")
+features <- features[features %in% names(md)]
+# konstante Merkmale entfernen (kein Informationsgehalt, brechen GLM)
+nicht_konstant <- vapply(features,
+  function(f) length(unique(md[[f]])) > 1, logical(1))
+features <- features[nicht_konstant]
+features_num <- intersect(features,
+                          c("gebaeudealter","wohnflaeche","alter_vn"))
+features_fct <- setdiff(features, features_num)
+
+# mittlerer Schaden der Zielgefahr (fuer Expected-Loss-Umrechnung)
+auf <- holn(roh, paste0("Aufwand ", ziel_gefahr))
+cl  <- holn(roh, paste0("Claims ",  ziel_gefahr))
+sev_mittel <- {
+  s <- sum(auf[cl > 0], na.rm = TRUE) / sum(cl[cl > 0], na.rm = TRUE)
+  if (!is.finite(s) || s <= 0) 2500 else s
+}
+n_md <- nrow(md)
+```
+
+Für die Modellierung stehen **`r length(features)` Kandidatenmerkmale** zur
+Verfügung; der Datensatz umfasst **`r zahl(n_md)` Verträge** der Gefahr
+*`r ziel_gefahr`*. Zielgröße ist die Schadenanzahl je Vertrag, die Exposure
+(`JE `r ziel_gefahr``) geht als Offset ein.
+
+```{r ziel-eda, fig.height=4.2}
+basis_freq <- sum(md$claims) / sum(md$expo)
+
+p1 <- ggplot(md, aes(claims)) +
+  geom_bar(fill = farbe_haupt, width = .7) +
+  scale_x_continuous(breaks = 0:max(md$claims)) +
+  labs(title = "Verteilung der Schadenanzahl", x = "Schäden je Vertrag",
+       y = "Anzahl Verträge")
+p2 <- ggplot(md, aes(expo)) +
+  geom_histogram(bins = 35, fill = farbe_gut, color = "white") +
+  labs(title = "Verteilung der Exposure", x = "Jahreseinheiten (JE)",
+       y = "Anzahl Verträge")
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  library(patchwork); p1 + p2
+} else { print(p1); print(p2) }
+```
+
+Die mittlere Schadenfrequenz im Bestand beträgt **`r zah2(basis_freq)`**
+Schäden je Jahreseinheit.
+
+# Kreuzvalidierungs-Rahmen
+
+Alle Modelle werden auf **identischen 5 Faltungen** trainiert und bewertet,
+damit der Vergleich fair ist. Gütemaß ist die mittlere Poisson-Devianz auf den
+jeweils ausgelassenen Daten (kleiner = besser).
+
+```{r cv-rahmen}
+set.seed(2026)
+K <- 5
+faltung <- sample(rep_len(seq_len(K), n_md))
+
+# Designmatrix (fuer glmnet & xgboost) – einmalig auf Gesamtdaten gebaut,
+# damit in keiner Faltung Dummy-Spalten fehlen
+form_x <- as.formula(paste("~", paste(features, collapse = " + ")))
+mm <- model.matrix(form_x, data = md)[, -1, drop = FALSE]
+
+# Designmatrix-Spalte -> Ursprungsmerkmal
+spalte_zu_merkmal <- function(cols) {
+  vapply(cols, function(cn) {
+    tref <- features[vapply(features, function(f)
+      startsWith(cn, f), logical(1))]
+    if (length(tref) == 0) cn else tref[which.max(nchar(tref))]
+  }, character(1))
+}
+
+# Formel fuer GLM-Familie (Offset explizit, ohne reformulate)
+form_glm <- as.formula(paste("claims ~ offset(log(expo)) +",
+                             paste(features, collapse = " + ")))
+```
+
+```{r cv-funktion}
+# -----------------------------------------------------------------------------
+# Generischer CV-Lauf: fit_fun(train_idx, test_idx) -> erwartete Schaeden (test)
+# -----------------------------------------------------------------------------
+cv_lauf <- function(fit_fun) {
+  dev <- rmse <- rep(NA_real_, K)
+  for (i in seq_len(K)) {
+    tr <- which(faltung != i); te <- which(faltung == i)
+    mu <- tryCatch(fit_fun(tr, te), error = function(e) NULL)
+    if (is.null(mu) || length(mu) != length(te)) next
+    mu <- pmax(as.numeric(mu), 1e-9)
+    dev[i]  <- poisson_dev(md$claims[te], mu)
+    rmse[i] <- sqrt(mean((md$claims[te] - mu)^2))
+  }
+  list(dev = dev, rmse = rmse,
+       dev_m = mean(dev, na.rm = TRUE), dev_s = sd(dev, na.rm = TRUE),
+       rmse_m = mean(rmse, na.rm = TRUE),
+       ok = sum(!is.na(dev)) > 0)
+}
+```
+
+# Modelle, Merkmalsauswahl und Kreuzvalidierung
+
+```{r ergebnis-container}
+# Sammelobjekte ueber alle Modelle
+mod_ergebnis <- list()   # CV-Kennzahlen
+mod_features <- list()   # gewaehlte Merkmale je Modell
+mod_pred     <- list()   # Vorhersage auf Gesamtbestand (fuer Expected Loss)
+
+erfasse <- function(name, cv, feats, pred_full) {
+  mod_ergebnis[[name]] <<- cv
+  mod_features[[name]] <<- feats
+  mod_pred[[name]]     <<- pred_full
+}
+```
+
+## Naiv-Benchmark (nur Mittelwert)
+
+```{r m-naiv}
+fit_naiv <- function(tr, te) {
+  lambda <- sum(md$claims[tr]) / sum(md$expo[tr])
+  lambda * md$expo[te]
+}
+cv_naiv <- cv_lauf(fit_naiv)
+pred_naiv <- (sum(md$claims) / sum(md$expo)) * md$expo
+erfasse("Naiv (Benchmark)", cv_naiv, character(0), pred_naiv)
+cat(sprintf("CV-Poisson-Devianz: %s\n", zah2(cv_naiv$dev_m)))
+```
+
+## Poisson-GLM (Referenz, alle Merkmale)
+
+```{r m-glm}
+fit_glm <- function(tr, te) {
+  m <- glm(form_glm, data = md[tr, ], family = poisson())
+  predict(m, md[te, ], type = "response")
+}
+cv_glm <- cv_lauf(fit_glm)
+glm_full  <- glm(form_glm, data = md, family = poisson())
+pred_glm  <- predict(glm_full, md, type = "response")
+erfasse("GLM Poisson (alle)", cv_glm, features, pred_glm)
+cat(sprintf("Merkmale: %d  |  CV-Devianz: %s\n",
+            length(features), zah2(cv_glm$dev_m)))
+```
+
+## Schrittweise Selektion (AIC)
+
+```{r m-step}
+if (hat_MASS) {
+  fit_step <- function(tr, te) {
+    full <- glm(form_glm, data = md[tr, ], family = poisson())
+    m <- MASS::stepAIC(full, direction = "both", trace = 0)
+    predict(m, md[te, ], type = "response")
+  }
+  cv_step  <- cv_lauf(fit_step)
+  step_mod <- MASS::stepAIC(glm(form_glm, data = md, family = poisson()),
+                            direction = "both", trace = 0)
+  step_feat <- intersect(features, all.vars(formula(step_mod)))
+  pred_step <- predict(step_mod, md, type = "response")
+  erfasse("Schrittweise (AIC)", cv_step, step_feat, pred_step)
+  cat(sprintf("gewählte Merkmale: %d von %d  |  CV-Devianz: %s\n",
+              length(step_feat), length(features), zah2(cv_step$dev_m)))
+} else {
+  cat("Übersprungen – Paket 'MASS' nicht installiert.")
+}
+```
+
+## Elastic Net (`glmnet`, L1-Selektion)
+
+```{r m-glmnet}
+if (hat_glmnet) {
+  fit_glmnet <- function(tr, te) {
+    cvf <- glmnet::cv.glmnet(mm[tr, ], md$claims[tr], family = "poisson",
+             offset = log(md$expo[tr]), alpha = 0.5, nfolds = 5)
+    as.numeric(predict(cvf, mm[te, ], newoffset = log(md$expo[te]),
+                       s = "lambda.1se", type = "response"))
+  }
+  cv_net <- cv_lauf(fit_glmnet)
+  net_full <- glmnet::cv.glmnet(mm, md$claims, family = "poisson",
+                offset = log(md$expo), alpha = 0.5, nfolds = 5)
+  co <- as.matrix(coef(net_full, s = "lambda.1se"))
+  aktiv_cols <- rownames(co)[co[, 1] != 0]
+  aktiv_cols <- setdiff(aktiv_cols, "(Intercept)")
+  net_feat <- unique(spalte_zu_merkmal(aktiv_cols))
+  net_feat <- intersect(features, net_feat)
+  pred_net <- as.numeric(predict(net_full, mm, newoffset = log(md$expo),
+                                 s = "lambda.1se", type = "response"))
+  erfasse("Elastic Net", cv_net, net_feat, pred_net)
+  cat(sprintf("gewählte Merkmale: %d von %d  |  CV-Devianz: %s\n",
+              length(net_feat), length(features), zah2(cv_net$dev_m)))
+} else {
+  cat("Übersprungen – Paket 'glmnet' nicht installiert.")
+}
+```
+
+## Random Forest (`ranger`, Permutations-Wichtigkeit)
+
+```{r m-rf}
+if (hat_ranger) {
+  rf_form <- as.formula(paste("freq ~", paste(features, collapse = " + ")))
+  fit_rf <- function(tr, te) {
+    d <- md[tr, ]; d$freq <- d$claims / d$expo
+    m <- ranger::ranger(rf_form, data = d, case.weights = d$expo,
+                        num.trees = 400, min.node.size = 20)
+    pmax(predict(m, md[te, ])$predictions, 0) * md$expo[te]
+  }
+  cv_rf <- cv_lauf(fit_rf)
+  d_full <- md; d_full$freq <- d_full$claims / d_full$expo
+  rf_full <- ranger::ranger(rf_form, data = d_full,
+              case.weights = d_full$expo, num.trees = 600,
+              min.node.size = 20, importance = "permutation")
+  imp_rf <- sort(ranger::importance(rf_full), decreasing = TRUE)
+  # gewaehlt: Wichtigkeit >= 5 % der wichtigsten Variable
+  rf_feat <- names(imp_rf)[imp_rf >= max(imp_rf) * 0.05 & imp_rf > 0]
+  pred_rf <- pmax(predict(rf_full, md)$predictions, 0) * md$expo
+  erfasse("Random Forest", cv_rf, rf_feat, pred_rf)
+  cat(sprintf("relevante Merkmale: %d von %d  |  CV-Devianz: %s\n",
+              length(rf_feat), length(features), zah2(cv_rf$dev_m)))
+} else {
+  cat("Übersprungen – Paket 'ranger' nicht installiert.")
+}
+```
+
+```{r m-rf-imp}
+if (hat_ranger && exists("imp_rf")) {
+  tibble(merkmal = names(imp_rf), wichtigkeit = as.numeric(imp_rf)) %>%
+    ggplot(aes(reorder(merkmal, wichtigkeit), wichtigkeit)) +
+    geom_col(fill = farbe_haupt, width = .65) +
+    coord_flip() +
+    labs(title = "Random Forest – Permutations-Wichtigkeit",
+         subtitle = "höhere Werte = größerer Beitrag zur Vorhersagegüte",
+         x = NULL, y = "Wichtigkeit")
+}
+```
+
+## Gradient Boosting (`xgboost`, Gain-Wichtigkeit)
+
+```{r m-xgb}
+if (hat_xgboost) {
+  xgb_par <- list(objective = "count:poisson", eta = 0.1, max_depth = 3,
+                  subsample = 0.9, colsample_bytree = 0.9)
+  fit_xgb <- function(tr, te) {
+    dtr <- xgboost::xgb.DMatrix(mm[tr, ], label = md$claims[tr])
+    xgboost::setinfo(dtr, "base_margin", log(md$expo[tr]))
+    dte <- xgboost::xgb.DMatrix(mm[te, ])
+    xgboost::setinfo(dte, "base_margin", log(md$expo[te]))
+    m <- xgboost::xgb.train(xgb_par, dtr, nrounds = 160, verbose = 0)
+    predict(m, dte)
+  }
+  cv_xgb <- cv_lauf(fit_xgb)
+  dall <- xgboost::xgb.DMatrix(mm, label = md$claims)
+  xgboost::setinfo(dall, "base_margin", log(md$expo))
+  xgb_full <- xgboost::xgb.train(xgb_par, dall, nrounds = 160, verbose = 0)
+  imp_xgb <- as_tibble(xgboost::xgb.importance(model = xgb_full))
+  imp_xgb$merkmal <- spalte_zu_merkmal(imp_xgb$Feature)
+  imp_xgb_agg <- imp_xgb %>% group_by(merkmal) %>%
+    summarise(gain = sum(Gain), .groups = "drop") %>%
+    arrange(desc(gain))
+  # gewaehlt: Gain-Anteil >= 2 %
+  xgb_feat <- imp_xgb_agg$merkmal[imp_xgb_agg$gain >= 0.02]
+  xgb_feat <- intersect(features, xgb_feat)
+  pred_xgb <- predict(xgb_full, dall)
+  erfasse("Gradient Boosting", cv_xgb, xgb_feat, pred_xgb)
+  cat(sprintf("relevante Merkmale: %d von %d  |  CV-Devianz: %s\n",
+              length(xgb_feat), length(features), zah2(cv_xgb$dev_m)))
+} else {
+  cat("Übersprungen – Paket 'xgboost' nicht installiert.")
+}
+```
+
+```{r m-xgb-imp}
+if (hat_xgboost && exists("imp_xgb_agg")) {
+  ggplot(imp_xgb_agg, aes(reorder(merkmal, gain), gain)) +
+    geom_col(fill = farbe_akzent, width = .65) +
+    coord_flip() +
+    scale_y_continuous(labels = pct) +
+    labs(title = "Gradient Boosting – Gain-Wichtigkeit",
+         subtitle = "Anteil am erklärten Informationsgewinn",
+         x = NULL, y = "Gain-Anteil")
+}
+```
+
+# Modellvergleich
+
+```{r vergleich-tabelle}
+namen <- names(mod_ergebnis)
+dev_naiv_m <- mod_ergebnis[["Naiv (Benchmark)"]]$dev_m
+
+vergleich <- map_dfr(namen, function(nm) {
+  cv <- mod_ergebnis[[nm]]
+  feats <- mod_features[[nm]]
+  pr <- mod_pred[[nm]]
+  tibble(
+    Modell        = nm,
+    `Anzahl Merkmale` = length(feats),
+    `CV-Devianz`  = cv$dev_m,
+    `CV-Devianz SD` = cv$dev_s,
+    `CV-RMSE`     = cv$rmse_m,
+    `Erklärte Devianz` = 1 - cv$dev_m / dev_naiv_m,
+    `Erwartete Schäden` = sum(pr, na.rm = TRUE),
+    `Expected Loss` = sum(pr, na.rm = TRUE) * sev_mittel
+  )
+}) %>% arrange(`CV-Devianz`)
+
+tab <- vergleich %>%
+  transmute(
+    Modell,
+    `# Merkmale` = `Anzahl Merkmale`,
+    `CV-Devianz` = zah2(`CV-Devianz`),
+    `± SD`       = zah2(`CV-Devianz SD`),
+    `CV-RMSE`    = zah2(`CV-RMSE`),
+    `Erkl. Devianz` = pct(`Erklärte Devianz`),
+    `Erw. Schäden`  = zahl(`Erwartete Schäden`),
+    `Expected Loss` = eur(`Expected Loss`)
+  )
+kable(tab, align = c("l", rep("r", 7)),
+      caption = paste0("Modellvergleich – Zielgefahr ", ziel_gefahr,
+                       " (sortiert nach CV-Devianz, bestes Modell oben)"))
+```
+
+```{r vergleich-plot}
+bestes <- vergleich$Modell[1]
+ggplot(vergleich, aes(reorder(Modell, -`CV-Devianz`), `CV-Devianz`,
+                      fill = Modell == bestes)) +
+  geom_col(width = .65) +
+  geom_errorbar(aes(ymin = `CV-Devianz` - `CV-Devianz SD`,
+                    ymax = `CV-Devianz` + `CV-Devianz SD`),
+                width = .25, color = farbe_grau) +
+  geom_text(aes(label = zah2(`CV-Devianz`)), hjust = -.15, size = 3.3) +
+  scale_fill_manual(values = c(`TRUE` = farbe_gut, `FALSE` = farbe_haupt),
+                    guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, .18))) +
+  coord_flip() +
+  labs(title = "Kreuzvalidierte Modellgüte",
+       subtitle = paste0("mittlere Poisson-Devianz aus ", K,
+                          " Faltungen – bestes Modell: ", bestes),
+       x = NULL, y = "CV-Poisson-Devianz (kleiner = besser)")
+```
+
+```{r vergleich-features}
+feat_tab <- map_dfr(namen, function(nm) {
+  f <- mod_features[[nm]]
+  tibble(Modell = nm,
+         Merkmale = if (length(f) == 0) "–" else paste(sort(f), collapse = ", "))
+})
+kable(feat_tab, caption = "Je Modell ausgewählte Merkmale")
+```
+
+# Universelle Merkmalsauswahl
+
+Als universell gelten Merkmale, auf die sich die **selektierenden** Verfahren
+einigen (Naiv-Benchmark und die GLM-Referenz ohne Selektion bleiben außen vor).
+
+```{r universell}
+selektierer <- intersect(
+  c("Schrittweise (AIC)","Elastic Net","Random Forest","Gradient Boosting"),
+  namen)
+n_sel <- length(selektierer)
+
+wahl <- map_dfr(features, function(f) {
+  tibble(merkmal = f,
+         treffer = sum(vapply(selektierer,
+                       function(m) f %in% mod_features[[m]], logical(1))))
+}) %>%
+  mutate(anteil = treffer / pmax(n_sel, 1),
+         status = case_when(
+           anteil == 1            ~ "universell",
+           anteil >= 0.5          ~ "mehrheitlich",
+           TRUE                   ~ "verworfen")) %>%
+  arrange(desc(treffer))
+
+universelle_merkmale <- wahl$merkmal[wahl$anteil == 1]
+
+ggplot(wahl, aes(reorder(merkmal, treffer), treffer, fill = status)) +
+  geom_col(width = .65) +
+  geom_text(aes(label = paste0(treffer, "/", n_sel)),
+            hjust = -.2, size = 3.3) +
+  scale_fill_manual(values = c("universell" = farbe_gut,
+      "mehrheitlich" = farbe_haupt, "verworfen" = farbe_grau), name = NULL) +
+  scale_y_continuous(breaks = 0:n_sel,
+                     expand = expansion(mult = c(0, .15))) +
+  coord_flip() +
+  labs(title = "Merkmals-Konsens über die ML-Verfahren",
+       subtitle = paste("Anzahl Verfahren (von", n_sel,
+                         "), die das Merkmal auswählen"),
+       x = NULL, y = "Treffer")
+```
+
+```{r universell-heatmap}
+heat <- expand_grid(merkmal = features, Modell = selektierer) %>%
+  mutate(gewaehlt = map2_lgl(merkmal, Modell,
+           ~ .x %in% mod_features[[.y]]),
+         gewaehlt = ifelse(gewaehlt, "gewählt", "verworfen"))
+ggplot(heat, aes(Modell, reorder(merkmal, gewaehlt == "gewählt"),
+                 fill = gewaehlt)) +
+  geom_tile(color = "white", linewidth = 1.2) +
+  scale_fill_manual(values = c("gewählt" = farbe_gut,
+                               "verworfen" = "#E8E8E8"), name = NULL) +
+  labs(title = "Merkmalsauswahl je Verfahren",
+       x = NULL, y = NULL) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+```{r universell-text, results='asis'}
+cat(sprintf(paste0("Von **%d Kandidatenmerkmalen** werden **%d** von allen ",
+  "Verfahren übereinstimmend gewählt (universell): **%s**. Diese Merkmale ",
+  "bilden die robuste Basis für das produktive Tarifmodell. Merkmale mit ",
+  "geringem Konsens (z. B. mit 0/%d Treffern) tragen kaum Information bei ",
+  "und können entfallen.\n"),
+  length(features), length(universelle_merkmale),
+  if (length(universelle_merkmale) > 0)
+    paste(universelle_merkmale, collapse = ", ") else "keines",
+  n_sel))
+```
+
+# Bestes Modell – Detailauswertung
+
+```{r bestes-detail}
+pred_best <- mod_pred[[bestes]]
+detail <- md %>%
+  mutate(vorhersage = pred_best,
+         dezil = ntile(vorhersage / expo, 10))
+
+lift <- detail %>%
+  group_by(dezil) %>%
+  summarise(beobachtet = sum(claims) / sum(expo),
+            modell     = sum(vorhersage) / sum(expo),
+            .groups = "drop") %>%
+  pivot_longer(c(beobachtet, modell), names_to = "art", values_to = "freq")
+
+ggplot(lift, aes(factor(dezil), freq, fill = art)) +
+  geom_col(position = "dodge", width = .7) +
+  scale_fill_manual(values = c("beobachtet" = farbe_grau,
+      "modell" = farbe_haupt), labels = c("beobachtet","Modell"),
+      name = NULL) +
+  labs(title = paste0("Lift-Diagramm – ", bestes),
+       subtitle = paste("Verträge nach vorhergesagter Frequenz in 10 Dezile;",
+                         "gute Modelle trennen die Risiken sichtbar"),
+       x = "Risikodezil (1 = niedrigste Frequenz)", y = "Frequenz je JE")
+```
+
+```{r bestes-kalibrierung}
+cat(sprintf(paste0("Aggregierte Kalibrierung des besten Modells (%s): ",
+  "beobachtet **%s** Schäden, vorhergesagt **%s** – Abweichung **%s**. ",
+  "Modell-implizierter Expected Loss des Bestands: **%s**.\n"),
+  bestes, zahl(sum(md$claims)), zahl(sum(pred_best)),
+  pct(sum(pred_best) / sum(md$claims) - 1),
+  eur(sum(pred_best) * sev_mittel)))
+```
+
+# Zusammenfassung
+
+```{r fazit, echo=FALSE, results='asis'}
+univ_text <- if (length(universelle_merkmale) > 0)
+  paste0("Übereinstimmend gewählt werden ",
+         paste(universelle_merkmale, collapse = ", "), ".")
+else
+  paste0("Es gibt keine vollständige Übereinstimmung; die mehrheitlich ",
+         "gewählten Merkmale sind der Konsens-Grafik zu entnehmen.")
+
+cat(paste0(
+"- **Modellselektion**: Verglichen wurden ", length(namen),
+" Verfahren über ", K, "-fache Kreuzvalidierung. Bestes Modell nach ",
+"CV-Poisson-Devianz: **", bestes, "**.\n",
+"- **Feature-Selektion**: Lasso/Elastic Net, schrittweise Selektion sowie die ",
+"Wichtigkeitsmaße von Random Forest und Gradient Boosting liefern jeweils ",
+"eine eigene Merkmalsauswahl; die Ergebnistabellen zeigen Anzahl und Liste.\n",
+"- **Universelle Merkmale**: ", univ_text, "\n",
+"- **Expected Loss**: Je Modell ist der implizierte erwartete Schadenaufwand ",
+"ausgewiesen; er sollte nahe am beobachteten Aufwand liegen (Kalibrierung).\n",
+"- **Nächste Schritte**: Das beste Modell auf einem echten Hold-out-Sample ",
+"prüfen, Hyperparameter (z. B. xgboost) feiner tunen und die universellen ",
+"Merkmale als Grundgerüst des produktiven Tarifs verwenden.\n"))
+```
+
+```{r sessioninfo, echo=FALSE}
+cat("Erstellt am", format(Sys.time(), "%d.%m.%Y %H:%M"),
+    "| Modus:", if (demo_modus) "DEMODATEN" else "Echtdaten",
+    "| Zielgefahr:", ziel_gefahr)
+```
