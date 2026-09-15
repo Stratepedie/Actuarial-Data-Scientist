@@ -1,0 +1,1 @@
+https://glum.readthedocs.io/en/latest/tutorials/glm_french_motor_tutorial/glm_french_motor.html?utm_source=chatgpt.com
